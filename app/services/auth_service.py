@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from passlib.context import CryptContext
+import bcrypt
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 import secrets
@@ -12,20 +12,47 @@ from app.database import User, UserSession
 from app.utils.logger import logger
 from fastapi import HTTPException, status
 
-# Password hashing context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 class AuthService:
     @staticmethod
     def hash_password(password: str) -> str:
         """Hash a password using bcrypt"""
-        return pwd_context.hash(password)
+        # Ensure password is a string
+        if not isinstance(password, str):
+            password = str(password)
+        
+        # Bcrypt has a 72-byte limit - truncate password to 72 bytes if needed
+        password_bytes = password.encode('utf-8')
+        if len(password_bytes) > 72:
+            # Truncate to exactly 72 bytes
+            password_bytes = password_bytes[:72]
+            # Decode back, handling any incomplete UTF-8 sequences
+            try:
+                password = password_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                # If decode fails, remove last byte and try again
+                password_bytes = password_bytes[:-1]
+                password = password_bytes.decode('utf-8', errors='ignore')
+        
+        # Hash using bcrypt directly (more reliable than passlib for this use case)
+        salt = bcrypt.gensalt(rounds=12)
+        hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+        return hashed.decode('utf-8')
     
     @staticmethod
     def verify_password(plain_password: str, hashed_password: str) -> bool:
         """Verify a password against a hash"""
-        return pwd_context.verify(plain_password, hashed_password)
+        try:
+            # Truncate password if needed (bcrypt 72-byte limit)
+            password_bytes = plain_password.encode('utf-8')
+            if len(password_bytes) > 72:
+                password_bytes = password_bytes[:72]
+                plain_password = password_bytes.decode('utf-8', errors='ignore')
+            
+            return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+        except Exception as e:
+            logger.error("Password verification error", error=str(e))
+            return False
     
     @staticmethod
     def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -53,9 +80,37 @@ class AuthService:
         password: str
     ) -> User:
         """Create a new user"""
-        # Check if user already exists
-        existing_user = await AuthService.get_user_by_email(db, email)
+        # Normalize email
+        normalized_email = email.lower().strip()
+        
+        # Double-check if user already exists (case-insensitive)
+        # Check with both normalized and original email to catch any edge cases
+        existing_user = await AuthService.get_user_by_email(db, normalized_email)
         if existing_user:
+            logger.warning("User creation blocked - email already exists", 
+                          email=normalized_email, 
+                          existing_user_id=str(existing_user.id))
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+        
+        # Also check with original email (in case database has different case)
+        # This is a safety check for SQL Server case-sensitivity issues
+        from sqlalchemy import func, or_
+        result = await db.execute(
+            select(User).where(
+                or_(
+                    func.lower(User.email) == normalized_email,
+                    User.email == email.strip()  # Also check exact match
+                )
+            )
+        )
+        existing_user_alt = result.scalar_one_or_none()
+        if existing_user_alt:
+            logger.warning("User creation blocked - email exists (alternative check)", 
+                          email=normalized_email, 
+                          existing_user_id=str(existing_user_alt.id))
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered"
@@ -65,25 +120,72 @@ class AuthService:
         password_hash = AuthService.hash_password(password)
         
         # Create user
+        # Generate ID explicitly to ensure compatibility with SQLite (strings) and PostgreSQL/SQL Server (UUID objects)
+        from app.database import generate_uuid
+        user_id = generate_uuid()
+        
         user = User(
+            id=user_id,
             full_name=full_name,
-            email=email,
+            email=normalized_email,  # Store normalized email
             password_hash=password_hash,
             provider='email',
             role='user'
         )
         
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
-        
-        logger.info("User created", user_id=str(user.id), email=email)
-        return user
+        try:
+            db.add(user)
+            await db.commit()
+            await db.refresh(user)
+            
+            logger.info("User created successfully", user_id=str(user.id), email=normalized_email)
+            return user
+        except Exception as e:
+            await db.rollback()
+            error_str = str(e).lower()
+            
+            # Check if it's a unique constraint violation (email already exists)
+            if any(keyword in error_str for keyword in [
+                "unique", "duplicate", "already exists", 
+                "violation", "constraint", "idx_users_email",
+                "cannot insert duplicate", "duplicate key"
+            ]):
+                # Double-check the database one more time
+                final_check = await AuthService.get_user_by_email(db, normalized_email)
+                if final_check:
+                    logger.warning("User creation failed - email exists in database", 
+                                  email=normalized_email,
+                                  existing_user_id=str(final_check.id))
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Email already registered"
+                    )
+                else:
+                    # This shouldn't happen, but log it
+                    logger.error("Unique constraint violation but user not found on retry", 
+                               email=normalized_email, error=str(e))
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Email already registered"
+                    )
+            
+            # Re-raise other exceptions
+            logger.error("Error creating user", error=str(e), email=normalized_email, exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to create user: {str(e) if settings.DEBUG else 'Internal server error'}"
+            )
     
     @staticmethod
     async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
-        """Get user by email"""
-        result = await db.execute(select(User).where(User.email == email))
+        """Get user by email (case-insensitive)"""
+        # Normalize email to lowercase for comparison
+        # SQL Server comparisons are case-insensitive by default, but be explicit
+        from sqlalchemy import func
+        normalized_email = email.lower().strip()
+        result = await db.execute(
+            select(User).where(func.lower(User.email) == normalized_email)
+        )
         return result.scalar_one_or_none()
     
     @staticmethod
@@ -99,11 +201,19 @@ class AuthService:
         password: str
     ) -> Optional[User]:
         """Authenticate a user with email and password"""
-        user = await AuthService.get_user_by_email(db, email)
+        # Normalize email for lookup
+        normalized_email = email.lower().strip()
+        logger.info("Attempting authentication", email=normalized_email)
+        
+        user = await AuthService.get_user_by_email(db, normalized_email)
         if not user:
+            logger.warning("Authentication failed - user not found", email=normalized_email)
             return None
         
+        logger.info("User found", user_id=str(user.id), email=user.email, has_password=bool(user.password_hash))
+        
         if not user.is_active:
+            logger.warning("Authentication failed - user inactive", user_id=str(user.id), email=user.email)
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="User account is inactive"
@@ -111,14 +221,19 @@ class AuthService:
         
         # Check if user has a password (OAuth users don't have passwords)
         if not user.password_hash:
+            logger.warning("Authentication failed - OAuth user trying password login", user_id=str(user.id), email=user.email)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="This account was created with Google. Please sign in with Google."
             )
         
-        if not AuthService.verify_password(password, user.password_hash):
+        # Verify password
+        password_valid = AuthService.verify_password(password, user.password_hash)
+        if not password_valid:
+            logger.warning("Authentication failed - incorrect password", user_id=str(user.id), email=user.email)
             return None
         
+        logger.info("Authentication successful", user_id=str(user.id), email=user.email)
         return user
     
     @staticmethod

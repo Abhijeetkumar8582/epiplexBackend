@@ -15,6 +15,7 @@ import aiofiles
 from contextlib import asynccontextmanager
 from typing import Optional, List
 from datetime import timedelta, datetime
+from uuid import UUID
 
 from app.config import settings
 from app.database import init_db, get_db, AsyncSession, User
@@ -57,9 +58,11 @@ limiter = Limiter(key_func=get_remote_address)
 UPLOAD_DIR = settings.UPLOAD_DIR
 OUTPUT_DIR = settings.OUTPUT_DIR
 FRAMES_DIR = settings.FRAMES_DIR
+AUDIO_DIR = settings.AUDIO_DIR
 UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 FRAMES_DIR.mkdir(exist_ok=True, parents=True)
+AUDIO_DIR.mkdir(exist_ok=True, parents=True)
 
 # Initialize services
 video_processor = VideoProcessor()
@@ -152,14 +155,27 @@ async def get_current_user(
     if user_id is None:
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
     
-    user = await AuthService.get_user_by_id(db, uuid.UUID(user_id))
-    if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
-    
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="User account is inactive")
-    
-    return user
+    try:
+        # Convert user_id to UUID - handle both string and UUID formats
+        if isinstance(user_id, str):
+            user_uuid = uuid.UUID(user_id)
+        else:
+            user_uuid = user_id
+        
+        user = await AuthService.get_user_by_id(db, user_uuid)
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="User account is inactive")
+        
+        return user
+    except (ValueError, TypeError) as e:
+        logger.error("Invalid user ID format in token", user_id=user_id, error=str(e))
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    except Exception as e:
+        logger.error("Error getting current user", error=str(e), exc_info=True)
+        raise HTTPException(status_code=401, detail="Failed to authenticate user")
 
 
 def get_client_ip(request: Request) -> Optional[str]:
@@ -192,9 +208,9 @@ async def signup(
             password=user_data.password
         )
         
-        # Log activity
+        # Log activity (non-blocking - uses separate session, won't affect signup)
         await ActivityService.log_activity(
-            db=db,
+            db=None,  # Use separate session to avoid transaction conflicts
             user_id=user.id,
             action="SIGNUP",
             description=f"User {user.email} registered",
@@ -208,8 +224,13 @@ async def signup(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Signup error", error=str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to register user")
+        error_detail = str(e)
+        logger.error("Signup error", error=error_detail, exc_info=True)
+        # Return more detailed error in debug mode
+        if settings.DEBUG:
+            raise HTTPException(status_code=500, detail=f"Failed to register user: {error_detail}")
+        else:
+            raise HTTPException(status_code=500, detail="Failed to register user")
 
 
 @app.post("/api/auth/login", response_model=LoginResponse)
@@ -229,45 +250,79 @@ async def login(
         )
         
         if not user:
+            logger.warning("Login failed - incorrect credentials", email=credentials.email)
             raise HTTPException(status_code=401, detail="Incorrect email or password")
         
-        # Update last login
-        await AuthService.update_last_login(db, user.id)
+        logger.info("User authenticated successfully", user_id=str(user.id), email=user.email)
+        
+        # Update last login (non-blocking - if it fails, don't fail the login)
+        try:
+            await AuthService.update_last_login(db, user.id)
+        except Exception as login_update_error:
+            logger.warning("Failed to update last login", error=str(login_update_error), user_id=str(user.id))
         
         # Create access token
-        access_token = AuthService.create_access_token(
-            data={"sub": str(user.id), "email": user.email, "role": user.role},
-            expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-        )
+        try:
+            access_token = AuthService.create_access_token(
+                data={"sub": str(user.id), "email": user.email, "role": user.role},
+                expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+            )
+        except Exception as token_error:
+            logger.error("Failed to create access token", error=str(token_error), user_id=str(user.id))
+            raise HTTPException(status_code=500, detail="Failed to create access token")
         
-        # Create session
-        session = await AuthService.create_session(
-            db=db,
-            user_id=user.id,
-            ip_address=get_client_ip(request),
-            user_agent=get_user_agent(request)
-        )
+        # Create session (non-blocking - if it fails, still allow login but log the error)
+        session = None
+        try:
+            session = await AuthService.create_session(
+                db=db,
+                user_id=user.id,
+                ip_address=get_client_ip(request),
+                user_agent=get_user_agent(request)
+            )
+        except Exception as session_error:
+            logger.error("Failed to create session", error=str(session_error), user_id=str(user.id), exc_info=True)
+            # Create a temporary session token for response
+            session_token = AuthService.generate_session_token()
+            expires_at = datetime.utcnow() + timedelta(days=7)
+            # Don't fail login if session creation fails
         
-        # Log activity
+        # Log activity (non-blocking - uses separate session, won't affect login)
+        # Pass None for db to use separate session
         await ActivityService.log_activity(
-            db=db,
+            db=None,  # Use separate session to avoid transaction conflicts
             user_id=user.id,
             action="LOGIN",
             description=f"User {user.email} logged in",
             ip_address=get_client_ip(request)
         )
         
-        return LoginResponse(
-            access_token=access_token,
-            session_token=session.session_token,
-            user=UserResponse.model_validate(user),
-            expires_at=session.expires_at
-        )
+        # Return response
+        if session:
+            return LoginResponse(
+                access_token=access_token,
+                session_token=session.session_token,
+                user=UserResponse.model_validate(user),
+                expires_at=session.expires_at
+            )
+        else:
+            # Fallback if session creation failed
+            return LoginResponse(
+                access_token=access_token,
+                session_token=AuthService.generate_session_token(),
+                user=UserResponse.model_validate(user),
+                expires_at=datetime.utcnow() + timedelta(days=7)
+            )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Login error", error=str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to login")
+        error_detail = str(e)
+        logger.error("Login error", error=error_detail, email=credentials.email, exc_info=True)
+        # Return more detailed error in debug mode
+        if settings.DEBUG:
+            raise HTTPException(status_code=500, detail=f"Failed to login: {error_detail}")
+        else:
+            raise HTTPException(status_code=500, detail="Failed to login")
 
 
 @app.get("/api/auth/me", response_model=UserResponse)
@@ -487,6 +542,19 @@ async def upload_video(
         # Use provided name or default to filename
         video_name = name or file.filename or "Untitled Video"
         
+        # Parse tags if provided (comma-separated string or JSON array)
+        tags_list = None
+        if tags:
+            try:
+                # Try parsing as JSON array first
+                import json
+                tags_list = json.loads(tags)
+                if not isinstance(tags_list, list):
+                    tags_list = [t.strip() for t in tags.split(',')]
+            except (json.JSONDecodeError, ValueError):
+                # If not JSON, treat as comma-separated string
+                tags_list = [t.strip() for t in tags.split(',')]
+        
         # Create video upload record
         video_upload = await VideoUploadService.create_upload(
             db=db,
@@ -497,7 +565,11 @@ async def upload_video(
             original_input=file.filename or "unknown",
             status="uploaded",
             job_id=job_id,
-            metadata=metadata
+            metadata=metadata,
+            application_name=application_name,
+            tags=tags_list,
+            language_code=language_code,
+            priority=priority or "normal"
         )
         
         # Initialize job status in database
@@ -534,15 +606,8 @@ async def upload_video(
             ip_address=get_client_ip(request)
         )
         
-        # Start background processing
+        # Start background processing (complete pipeline: upload -> transcribe -> extract frames -> analyze with GPT -> store in DB)
         background_tasks.add_task(process_video_task, str(file_path), job_id, str(video_upload.id))
-        
-        # Start frame analysis in background (separate task for high performance)
-        background_tasks.add_task(
-            process_video_frames_task,
-            video_upload.id,
-            str(file_path)
-        )
         
         return VideoUploadResponse.model_validate(video_upload)
     except HTTPException:
@@ -998,7 +1063,7 @@ async def get_activity_logs(
             user_id=str(log.user_id),
             action=log.action,
             description=log.description,
-            metadata=log.metadata,
+            metadata=log.activity_metadata,
             ip_address=str(log.ip_address) if log.ip_address else None,
             created_at=log.created_at
         ) for log in logs],
@@ -1025,7 +1090,7 @@ async def get_activity_log(
         user_id=str(log.user_id),
         action=log.action,
         description=log.description,
-        metadata=log.metadata,
+        metadata=log.activity_metadata,
         ip_address=str(log.ip_address) if log.ip_address else None,
         created_at=log.created_at
     )
@@ -1049,7 +1114,7 @@ async def get_activity_stats(
                 user_id=str(log.user_id),
                 action=log.action,
                 description=log.description,
-                metadata=log.metadata,
+                metadata=log.activity_metadata,
                 ip_address=str(log.ip_address) if log.ip_address else None,
                 created_at=log.created_at
             ) for log in stats["recent_activities"]
@@ -1117,6 +1182,36 @@ async def get_gpt_responses_by_file_number(
     )
 
 
+@app.get("/api/videos/file-number/{video_file_number}/audio")
+async def get_audio_file(
+    video_file_number: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get audio file for a video by file number"""
+    from app.services.video_file_number_service import VideoFileNumberService
+    
+    upload = await VideoFileNumberService.get_upload_by_file_number(
+        db, video_file_number, str(current_user.id)
+    )
+    
+    if not upload:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    if not upload.audio_url:
+        raise HTTPException(status_code=404, detail="Audio file not available")
+    
+    audio_path = Path(upload.audio_url)
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio file not found on disk")
+    
+    return FileResponse(
+        path=str(audio_path),
+        filename=f"audio_{video_file_number}.mp3",
+        media_type="audio/mpeg"
+    )
+
+
 @app.get("/api/videos/file-number/{video_file_number}/document", response_model=DocumentResponse)
 async def get_document_by_file_number(
     request: Request,
@@ -1142,6 +1237,13 @@ async def get_document_by_file_number(
     
     upload = document_data["video_metadata"]
     frames = document_data["frames"]
+    
+    # Get transcript from job status if job_id exists
+    transcript = None
+    if upload.job_id:
+        job = await JobService.get_job(db, upload.job_id)
+        if job and job.transcript:
+            transcript = job.transcript
     
     # Log activity
     await ActivityService.log_activity(
@@ -1174,6 +1276,7 @@ async def get_document_by_file_number(
             tags=upload.tags,
             language_code=upload.language_code,
             priority=upload.priority,
+            audio_url=upload.audio_url,
             created_at=upload.created_at,
             updated_at=upload.updated_at
         ),
@@ -1193,146 +1296,93 @@ async def get_document_by_file_number(
             ) for fa in frames
         ],
         summary=document_data["summary"],
+        transcript=transcript,
         created_at=datetime.utcnow()
     )
 
 
 async def process_video_task(file_path: str, job_id: str, upload_id: Optional[str] = None):
-    """Background task to process video"""
+    """
+    Production-ready background task to process video:
+    1. Extract audio and transcribe using OpenAI Whisper
+    2. Extract keyframes (1 per second)
+    3. Process frames in batches of 5 through ChatGPT 4o Mini
+    4. Store everything in database
+    """
     from app.database import AsyncSessionLocal
+    from app.services.video_processing_service import VideoProcessingService
     
     async with AsyncSessionLocal() as db:
         try:
-            # Step 1: Upload complete
+            # Initialize processing service
+            processing_service = VideoProcessingService()
+            
+            # Step 1: Mark upload as complete
             await JobService.update_job(db, job_id, {
                 "progress": 5,
-                "message": "Video uploaded successfully",
+                "message": "Video uploaded successfully. Starting processing...",
                 "current_step": "upload",
                 "step_progress": {
                     "upload": "completed",
-                    "analyze": "pending",
+                    "transcribe": "pending",
                     "extract_frames": "pending",
-                    "process": "pending"
+                    "analyze_frames": "pending",
+                    "complete": "pending"
                 }
             })
             
-            # Step 2: Analyze - Extract transcript
-            await JobService.update_job(db, job_id, {
-                "progress": 15,
-                "message": "Analyzing video and extracting transcript...",
-                "current_step": "analyze",
-                "step_progress": {
-                    "upload": "completed",
-                    "analyze": "processing",
-                    "extract_frames": "pending",
-                    "process": "pending"
-                }
-            })
-            
-            transcript = video_processor.extract_transcript(file_path)
-            
-            await JobService.update_job(db, job_id, {
-                "progress": 30,
-                "message": "Transcript extracted successfully",
-                "transcript": transcript,  # Store transcript
-                "step_progress": {
-                    "upload": "completed",
-                    "analyze": "completed",
-                    "extract_frames": "pending",
-                    "process": "pending"
-                }
-            })
-            
-            # Step 3: Extract keyframes
-            await JobService.update_job(db, job_id, {
-                "progress": 35,
-                "message": "Extracting keyframes from video...",
-                "current_step": "extract_frames",
-                "step_progress": {
-                    "upload": "completed",
-                    "analyze": "completed",
-                    "extract_frames": "processing",
-                    "process": "pending"
-                }
-            })
-            
-            frame_analyses = video_processor.extract_and_analyze_frames(file_path)
-            
-            await JobService.update_job(db, job_id, {
-                "progress": 70,
-                "message": "Keyframes extracted and analyzed",
-                "frame_analyses": frame_analyses,  # Store frame analyses
-                "step_progress": {
-                    "upload": "completed",
-                    "analyze": "completed",
-                    "extract_frames": "completed",
-                    "process": "pending"
-                }
-            })
-            
-            # Step 4: Process - Generate document
-            await JobService.update_job(db, job_id, {
-                "progress": 75,
-                "message": "Processing and generating document...",
-                "current_step": "process",
-                "step_progress": {
-                    "upload": "completed",
-                    "analyze": "completed",
-                    "extract_frames": "completed",
-                    "process": "processing"
-                }
-            })
-            
-            try:
-                output_paths = document_generator.generate_document(
-                    job_id=job_id,
-                    transcript=transcript,
-                    frame_analyses=frame_analyses,
-                    output_dir=OUTPUT_DIR
-                )
-            except Exception as doc_error:
-                logger.error("Document generation failed", job_id=job_id, error=str(doc_error), exc_info=True)
-                await JobService.update_job(db, job_id, {
-                    "status": "failed",
-                    "message": f"Document generation failed: {str(doc_error)}",
-                    "current_step": "failed",
-                    "error": str(doc_error)
-                })
-                raise
-            
-            # Update status
-            await JobService.update_job(db, job_id, {
-                "status": "completed",
-                "progress": 100,
-                "message": "Processing completed successfully",
-                "current_step": "completed",
-                "step_progress": {
-                    "upload": "completed",
-                    "analyze": "completed",
-                    "extract_frames": "completed",
-                    "process": "completed"
-                },
-                "output_files": output_paths
-            })
-            
-            # Update video upload status if upload_id provided
+            # Convert upload_id to UUID if provided
+            video_uuid = None
             if upload_id:
-                try:
-                    from uuid import UUID
-                    await VideoUploadService.update_upload_status(db, UUID(upload_id), "completed")
-                except Exception as e:
-                    logger.error("Failed to update video upload status", upload_id=upload_id, error=str(e))
+                from uuid import UUID
+                video_uuid = UUID(upload_id)
             
-            logger.info("Job completed", job_id=job_id)
+            if not video_uuid:
+                raise ValueError("Video upload ID is required for processing")
+            
+            # Run complete processing pipeline
+            result = await processing_service.process_video_complete(
+                video_path=file_path,
+                video_id=video_uuid,
+                job_id=job_id,
+                frames_dir=FRAMES_DIR,
+                audio_dir=AUDIO_DIR,
+                db=db
+            )
+            
+            # Update video upload status to completed
+            try:
+                await VideoUploadService.update_upload_status(db, video_uuid, "completed", job_id)
+            except Exception as e:
+                logger.error("Failed to update video upload status", 
+                           upload_id=upload_id, 
+                           error=str(e))
+            
+            logger.info("Video processing completed successfully", 
+                       job_id=job_id, 
+                       upload_id=upload_id,
+                       transcript_length=len(result.get("transcript", "")),
+                       frames_analyzed=result.get("frame_analyses_count", 0))
             
         except Exception as e:
-            logger.error("Job failed", job_id=job_id, error=str(e), exc_info=True)
-            await JobService.update_job(db, job_id, {
-                "status": "failed",
-                "message": f"Error: {str(e)}",
-                "current_step": "failed",
-                "error": str(e)
-            })
+            logger.error("Video processing failed", 
+                        job_id=job_id, 
+                        upload_id=upload_id,
+                        error=str(e), 
+                        exc_info=True)
+            
+            # Update job status
+            try:
+                await JobService.update_job(db, job_id, {
+                    "status": "failed",
+                    "message": f"Processing failed: {str(e)}",
+                    "current_step": "failed",
+                    "error": str(e)
+                })
+            except Exception as update_error:
+                logger.error("Failed to update job status", 
+                           job_id=job_id, 
+                           error=str(update_error))
             
             # Update video upload status if upload_id provided
             if upload_id:
@@ -1340,7 +1390,9 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
                     from uuid import UUID
                     await VideoUploadService.update_upload_status(db, UUID(upload_id), "failed")
                 except Exception as upload_error:
-                    logger.error("Failed to update video upload status", upload_id=upload_id, error=str(upload_error))
+                    logger.error("Failed to update video upload status", 
+                               upload_id=upload_id, 
+                               error=str(upload_error))
 
 
 if __name__ == "__main__":

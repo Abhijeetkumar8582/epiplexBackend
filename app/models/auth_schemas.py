@@ -9,7 +9,7 @@ class UserSignup(BaseModel):
     """Schema for user registration"""
     full_name: str = Field(..., min_length=1, max_length=150, description="User's full name")
     email: EmailStr = Field(..., description="User's email address")
-    password: str = Field(..., min_length=8, max_length=100, description="User's password (min 8 characters)")
+    password: str = Field(..., min_length=4, max_length=20, description="User's password (4-20 characters, can contain special characters)")
 
 
 class UserLogin(BaseModel):

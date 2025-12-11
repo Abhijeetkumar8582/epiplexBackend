@@ -1,11 +1,13 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, func
-from typing import Optional, List, Dict, Any
+from sqlalchemy import select, desc, func, case
+from typing import Optional, List, Dict, Any, Tuple
 from uuid import UUID
 from datetime import datetime
 
-from app.database import VideoUpload
+from app.database import VideoUpload, FrameAnalysis
 from app.utils.logger import logger
+from app.services.video_file_number_service import VideoFileNumberService
+from app.config import settings
 
 
 class VideoUploadService:
@@ -238,24 +240,45 @@ class VideoUploadService:
         
         if video_ids:
             # Query frame counts per video
-            frame_stats_query = select(
-                FrameAnalysis.video_id,
-                func.count(FrameAnalysis.id).label('total_frames'),
-                func.count(FrameAnalysis.id).filter(
-                    FrameAnalysis.gpt_response.isnot(None)
-                ).label('frames_with_gpt')
-            ).where(
-                FrameAnalysis.video_id.in_(video_ids)
-            ).group_by(FrameAnalysis.video_id)
+            # Use CASE statement for SQL Server compatibility instead of .filter()
+            is_sql_server = "mssql" in settings.DATABASE_URL.lower()
             
-            frame_stats_result = await db.execute(frame_stats_query)
-            frame_stats = {
-                row.video_id: {
-                    'total_frames': row.total_frames,
-                    'frames_with_gpt': row.frames_with_gpt
+            if is_sql_server:
+                # SQL Server compatible query using CASE
+                frame_stats_query = select(
+                    FrameAnalysis.video_id,
+                    func.count(FrameAnalysis.id).label('total_frames'),
+                    func.sum(
+                        case((FrameAnalysis.gpt_response.isnot(None), 1), else_=0)
+                    ).label('frames_with_gpt')
+                ).where(
+                    FrameAnalysis.video_id.in_(video_ids)
+                ).group_by(FrameAnalysis.video_id)
+            else:
+                # PostgreSQL/SQLite compatible query
+                frame_stats_query = select(
+                    FrameAnalysis.video_id,
+                    func.count(FrameAnalysis.id).label('total_frames'),
+                    func.count(FrameAnalysis.id).filter(
+                        FrameAnalysis.gpt_response.isnot(None)
+                    ).label('frames_with_gpt')
+                ).where(
+                    FrameAnalysis.video_id.in_(video_ids)
+                ).group_by(FrameAnalysis.video_id)
+            
+            try:
+                frame_stats_result = await db.execute(frame_stats_query)
+                frame_stats = {
+                    row.video_id: {
+                        'total_frames': row.total_frames or 0,
+                        'frames_with_gpt': row.frames_with_gpt or 0
+                    }
+                    for row in frame_stats_result.all()
                 }
-                for row in frame_stats_result.all()
-            }
+            except Exception as e:
+                # If frame_analyses table doesn't exist, return empty stats
+                logger.warning(f"Could not fetch frame stats (table may not exist): {e}")
+                frame_stats = {}
         else:
             frame_stats = {}
         
@@ -322,6 +345,25 @@ class VideoUploadService:
             updates["job_id"] = job_id
         
         return await VideoUploadService.update_upload(db, upload_id, updates)
+    
+    @staticmethod
+    async def update_upload_audio(
+        db: AsyncSession,
+        upload_id: UUID,
+        audio_url: str
+    ) -> Optional[VideoUpload]:
+        """Update audio URL for a video upload"""
+        from sqlalchemy import update
+        
+        await db.execute(
+            update(VideoUpload)
+            .where(VideoUpload.id == upload_id)
+            .values(audio_url=audio_url, updated_at=datetime.utcnow())
+        )
+        await db.commit()
+        
+        logger.info("Audio URL updated", upload_id=str(upload_id), audio_url=audio_url)
+        return await VideoUploadService.get_upload(db, upload_id)
     
     @staticmethod
     async def soft_delete_upload(

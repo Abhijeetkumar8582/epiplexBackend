@@ -4,36 +4,52 @@ from typing import Optional, Dict, Any, List, Tuple
 from uuid import UUID
 from datetime import datetime, timedelta
 
-from app.database import UserActivityLog
+from app.database import UserActivityLog, AsyncSessionLocal
 from app.utils.logger import logger
 
 
 class ActivityService:
     @staticmethod
     async def log_activity(
-        db: AsyncSession,
+        db: Optional[AsyncSession],
         user_id: UUID,
         action: str,
         description: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         ip_address: Optional[str] = None
-    ) -> UserActivityLog:
-        """Log a user activity"""
-        activity = UserActivityLog(
-            user_id=user_id,
-            action=action,
-            description=description,
-            metadata=metadata,
-            ip_address=ip_address,
-            created_at=datetime.utcnow()
-        )
+    ) -> Optional[UserActivityLog]:
+        """
+        Log a user activity
         
-        db.add(activity)
-        await db.commit()
-        await db.refresh(activity)
-        
-        logger.info("Activity logged", user_id=str(user_id), action=action)
-        return activity
+        Uses a separate session to avoid transaction conflicts.
+        If the provided db session is used and fails, it won't affect the main transaction.
+        """
+        # Use a separate session to avoid transaction conflicts
+        async with AsyncSessionLocal() as activity_db:
+            try:
+                activity = UserActivityLog(
+                    user_id=user_id,
+                    action=action,
+                    description=description,
+                    activity_metadata=metadata,
+                    ip_address=ip_address,
+                    created_at=datetime.utcnow()
+                )
+                
+                activity_db.add(activity)
+                await activity_db.commit()
+                await activity_db.refresh(activity)
+                
+                logger.info("Activity logged", user_id=str(user_id), action=action)
+                return activity
+            except Exception as e:
+                await activity_db.rollback()
+                # Log the error but don't fail - activity logging is non-critical
+                logger.warning("Failed to log activity", 
+                             user_id=str(user_id), 
+                             action=action, 
+                             error=str(e))
+                return None
     
     @staticmethod
     async def get_user_activities(

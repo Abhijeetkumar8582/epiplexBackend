@@ -112,23 +112,29 @@ class GoogleOAuthService:
                 detail="Invalid Google user information"
             )
         
+        # Normalize email
+        normalized_email = email.lower().strip()
+        
         # Check if user exists by Google ID
         result = await db.execute(select(User).where(User.google_id == google_id))
         user = result.scalar_one_or_none()
         
         if user:
             # Update user info if needed
-            if user.email != email:
-                user.email = email
+            if user.email != normalized_email:
+                user.email = normalized_email
             if user.full_name != full_name:
                 user.full_name = full_name
             await db.commit()
             await db.refresh(user)
-            logger.info("User found by Google ID", user_id=str(user.id), email=email)
+            logger.info("User found by Google ID", user_id=str(user.id), email=normalized_email)
             return user
         
-        # Check if user exists by email (might have signed up with email/password)
-        result = await db.execute(select(User).where(User.email == email))
+        # Check if user exists by email (might have signed up with email/password) - case-insensitive
+        from sqlalchemy import func
+        result = await db.execute(
+            select(User).where(func.lower(User.email) == normalized_email)
+        )
         user = result.scalar_one_or_none()
         
         if user:
@@ -138,13 +144,13 @@ class GoogleOAuthService:
                 user.provider = "google"  # Update provider
                 await db.commit()
                 await db.refresh(user)
-                logger.info("Linked Google account to existing user", user_id=str(user.id), email=email)
+                logger.info("Linked Google account to existing user", user_id=str(user.id), email=normalized_email)
             return user
         
         # Create new user
         user = User(
             full_name=full_name,
-            email=email,
+            email=normalized_email,  # Store normalized email
             google_id=google_id,
             provider="google",
             password_hash=None,  # OAuth users don't have passwords
@@ -152,12 +158,32 @@ class GoogleOAuthService:
             is_active=True
         )
         
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
-        
-        logger.info("User created from Google OAuth", user_id=str(user.id), email=email, google_id=google_id)
-        return user
+        try:
+            db.add(user)
+            await db.commit()
+            await db.refresh(user)
+            
+            logger.info("User created from Google OAuth", user_id=str(user.id), email=normalized_email, google_id=google_id)
+            return user
+        except Exception as e:
+            await db.rollback()
+            # Check if it's a unique constraint violation
+            if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                # Try to get the existing user
+                result = await db.execute(
+                    select(User).where(func.lower(User.email) == normalized_email)
+                )
+                existing_user = result.scalar_one_or_none()
+                if existing_user:
+                    # Link Google account
+                    if not existing_user.google_id:
+                        existing_user.google_id = google_id
+                        existing_user.provider = "google"
+                        await db.commit()
+                        await db.refresh(existing_user)
+                    return existing_user
+            logger.error("Error creating user from Google OAuth", error=str(e), email=normalized_email)
+            raise
     
     @staticmethod
     async def authenticate_with_google(

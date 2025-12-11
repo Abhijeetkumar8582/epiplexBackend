@@ -36,6 +36,7 @@ class VideoMetadata(BaseModel):
     tags: Optional[List[str]] = None
     language_code: Optional[str] = None
     priority: Optional[str] = None
+    audio_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -51,6 +52,7 @@ class DocumentResponse(BaseModel):
     frames_with_gpt: int = Field(..., description="Number of frames with GPT responses")
     frames: List[FrameData] = Field(..., description="List of all frame analyses")
     summary: Dict[str, Any] = Field(..., description="Summary statistics")
+    transcript: Optional[str] = Field(None, description="Transcribed text from video audio")
     created_at: datetime = Field(..., description="When document was generated")
     
     class Config:

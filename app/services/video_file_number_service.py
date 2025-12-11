@@ -6,6 +6,7 @@ from datetime import datetime
 
 from app.database import VideoUpload
 from app.utils.logger import logger
+from app.config import settings
 
 
 class VideoFileNumberService:
@@ -22,15 +23,30 @@ class VideoFileNumberService:
         """
         current_year = datetime.utcnow().year
         
+        # Check if using SQL Server
+        is_sql_server = "mssql" in settings.DATABASE_URL.lower()
+        
         # Get the highest sequence number for current year
         # Using raw SQL for better performance with large datasets
-        query = text("""
-            SELECT COALESCE(MAX(
-                CAST(SUBSTRING(video_file_number FROM '\\d+$') AS INTEGER)
-            ), 0) as max_seq
-            FROM video_uploads
-            WHERE video_file_number LIKE :pattern
-        """)
+        if is_sql_server:
+            # SQL Server syntax: Use RIGHT to get last 4 characters (sequence number)
+            # Format is VF-YYYY-NNNN, so RIGHT(video_file_number, 4) gets NNNN
+            query = text("""
+                SELECT COALESCE(MAX(
+                    CAST(RIGHT(video_file_number, 4) AS INTEGER)
+                ), 0) as max_seq
+                FROM video_uploads
+                WHERE video_file_number LIKE :pattern
+            """)
+        else:
+            # PostgreSQL syntax: Use SUBSTRING with regex
+            query = text("""
+                SELECT COALESCE(MAX(
+                    CAST(SUBSTRING(video_file_number FROM '\\d+$') AS INTEGER)
+                ), 0) as max_seq
+                FROM video_uploads
+                WHERE video_file_number LIKE :pattern
+            """)
         
         pattern = f"VF-{current_year}-%"
         result = await db.execute(query, {"pattern": pattern})

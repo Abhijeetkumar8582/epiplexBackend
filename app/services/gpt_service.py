@@ -140,14 +140,14 @@ Frame timestamp: {:.2f} seconds""".format(timestamp_seconds)
     async def batch_analyze_frames(
         self,
         frames: List[Dict],
-        max_workers: int = 4
+        max_workers: int = 5
     ) -> List[Dict]:
         """
-        Analyze multiple frames in parallel
+        Analyze multiple frames in parallel (production-ready with error handling)
         
         Args:
             frames: List of frame dictionaries with 'image_path', 'timestamp', etc.
-            max_workers: Maximum number of concurrent API calls
+            max_workers: Maximum number of concurrent API calls (default: 5 for batch processing)
         
         Returns:
             List of analyzed frames with GPT responses
@@ -156,18 +156,40 @@ Frame timestamp: {:.2f} seconds""".format(timestamp_seconds)
         
         if not self.client:
             logger.error("OpenAI API key not configured. Cannot analyze frames.")
+            # Return frames with error messages
+            for frame in frames:
+                frame.update({
+                    "description": "OpenAI API key not configured",
+                    "ocr_text": None,
+                    "processing_time_ms": 0,
+                    "error": "OpenAI API key not configured"
+                })
             return frames
+        
+        if not frames:
+            return []
         
         # Create semaphore to limit concurrent API calls
         semaphore = asyncio.Semaphore(max_workers)
         
         async def analyze_with_semaphore(frame_data):
             async with semaphore:
-                return await self.analyze_frame(
-                    image_path=frame_data["image_path"],
-                    timestamp_seconds=frame_data["timestamp"],
-                    frame_number=frame_data.get("frame_number")
-                )
+                try:
+                    return await self.analyze_frame(
+                        image_path=frame_data.get("image_path") or frame_data.get("frame_path"),
+                        timestamp_seconds=frame_data.get("timestamp", 0.0),
+                        frame_number=frame_data.get("frame_number")
+                    )
+                except Exception as e:
+                    logger.error("Frame analysis exception",
+                               frame_index=frame_data.get("frame_number"),
+                               error=str(e))
+                    return {
+                        "description": f"Error analyzing frame: {str(e)}",
+                        "ocr_text": None,
+                        "processing_time_ms": 0,
+                        "error": str(e)
+                    }
         
         # Analyze all frames concurrently
         tasks = [analyze_with_semaphore(frame) for frame in frames]
@@ -179,6 +201,7 @@ Frame timestamp: {:.2f} seconds""".format(timestamp_seconds)
             if isinstance(result, Exception):
                 logger.error("Frame analysis failed",
                            frame_index=i,
+                           timestamp=frame.get("timestamp"),
                            error=str(result))
                 frame.update({
                     "description": f"Error: {str(result)}",
@@ -190,8 +213,12 @@ Frame timestamp: {:.2f} seconds""".format(timestamp_seconds)
                 frame.update(result)
             analyzed_frames.append(frame)
         
-        # Sort by timestamp
+        # Sort by timestamp to maintain order
         analyzed_frames.sort(key=lambda x: x.get("timestamp", 0))
+        
+        logger.info("Batch frame analysis completed",
+                   total_frames=len(analyzed_frames),
+                   successful=sum(1 for f in analyzed_frames if "error" not in f or not f.get("error")))
         
         return analyzed_frames
 

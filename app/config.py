@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     UPLOAD_DIR: Union[str, Path] = Path("./uploads")
     OUTPUT_DIR: Union[str, Path] = Path("./outputs")
     FRAMES_DIR: Union[str, Path] = Path("./frames")  # Directory for extracted frames
+    AUDIO_DIR: Union[str, Path] = Path("./audio")  # Directory for extracted audio files
     MAX_FILE_SIZE: int = 500 * 1024 * 1024  # 500MB
     ALLOWED_EXTENSIONS: Union[str, List[str]] = [".mp4", ".avi", ".mov", ".mkv", ".webm"]
     
@@ -43,7 +44,12 @@ class Settings(BaseSettings):
     FRAME_ANALYSIS_WORKERS: int = 4  # Number of parallel workers for frame analysis
     
     # Database Settings
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/epiplex"
+    # SQL Server format: mssql+aioodbc://user:password@host:port/database?driver=ODBC+Driver+17+for+SQL+Server
+    # PostgreSQL format: postgresql+asyncpg://user:password@host:port/database
+    # Instance: druidpartners.druidqa.druidplatform.com
+    # Database: Druid_AbhijeetKumar
+    # User: admin_abhijeetkumar
+    DATABASE_URL: str = "mssql+aioodbc://admin_abhijeetkumar:BpGWuAPyCm2_j7VKRVUlEHn2vi94nB6Z@druidpartners.druidqa.druidplatform.com:1433/Druid_AbhijeetKumar?driver=ODBC+Driver+17+for+SQL+Server"
     
     # Auth Settings
     SECRET_KEY: str = "your-secret-key-change-in-production"  # Should be in env
@@ -116,11 +122,56 @@ class Settings(BaseSettings):
             return [ext.strip() for ext in v.split(',') if ext.strip()]
         return v
     
+    @field_validator('OPENAI_API_KEY', mode='before')
+    @classmethod
+    def parse_openai_api_key(cls, v):
+        """Clean and validate OpenAI API key"""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            # Remove whitespace, newlines, and join if split across lines
+            cleaned = ''.join(v.split()).strip()
+            # Remove any quotes
+            cleaned = cleaned.strip('"\'')
+            # Check if it's still a placeholder value
+            if cleaned and cleaned.lower() in ['none', 'null', '']:
+                return None
+            if cleaned and 'your_openai_api_key_here' in cleaned.lower():
+                return None
+            return cleaned if cleaned else None
+        return v
+    
     class Config:
-        env_file = ".env"
+        # Ensure .env file is loaded from the backend directory
+        # Try multiple possible locations
+        _backend_dir = Path(__file__).parent.parent
+        _env_file = _backend_dir / ".env"
+        env_file = str(_env_file) if _env_file.exists() else ".env"
         case_sensitive = True
         # Allow reading from environment variables
         env_file_encoding = 'utf-8'
 
 
+# Try to load from environment variable as fallback if not in .env
+_openai_key_from_env = os.getenv("OPENAI_API_KEY")
+if _openai_key_from_env:
+    # Clean the key from environment variable too
+    _openai_key_from_env = ''.join(_openai_key_from_env.split()).strip().strip('"\'')
+    if _openai_key_from_env and 'your_openai_api_key_here' not in _openai_key_from_env.lower():
+        # Override with environment variable if it's valid
+        os.environ["OPENAI_API_KEY"] = _openai_key_from_env
+
 settings = Settings()
+
+# Validate and log API key status on import
+if settings.OPENAI_API_KEY:
+    masked_key = f"{settings.OPENAI_API_KEY[:7]}...{settings.OPENAI_API_KEY[-4:]}" if len(settings.OPENAI_API_KEY) > 11 else "***"
+    print(f"✓ OpenAI API key loaded: {masked_key}")
+    # Verify it's not a placeholder
+    if 'your_openai_api_key_here' in settings.OPENAI_API_KEY.lower() or 'your_ope' in settings.OPENAI_API_KEY.lower():
+        print("⚠️  Warning: OPENAI_API_KEY appears to be a placeholder value!")
+        print("   Please update your .env file with a valid API key")
+        settings.OPENAI_API_KEY = None
+else:
+    print("⚠️  Warning: OPENAI_API_KEY not found in .env file or environment variables")
+    print("   Please set OPENAI_API_KEY in your .env file or as an environment variable")
