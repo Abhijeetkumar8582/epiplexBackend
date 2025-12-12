@@ -27,4 +27,5 @@ httpx==0.25.2
 tenacity==8.2.3
 google-auth==2.25.2
 google-auth-oauthlib==1.2.0
+ffmpeg-python==0.2.0
 

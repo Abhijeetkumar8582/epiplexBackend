@@ -527,18 +527,6 @@ async def upload_video(
         # Generate unique ID for this processing job
         job_id = str(uuid.uuid4())
         
-        # Save uploaded file
-        file_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
-        async with aiofiles.open(file_path, "wb") as f:
-            content = await file.read()
-            await f.write(content)
-        
-        file_size_mb = file_path.stat().st_size / (1024 * 1024)
-        logger.info("File uploaded", job_id=job_id, filename=file.filename, size_mb=round(file_size_mb, 2))
-        
-        # Extract video metadata
-        metadata = VideoMetadataService.extract_metadata(str(file_path))
-        
         # Use provided name or default to filename
         video_name = name or file.filename or "Untitled Video"
         
@@ -555,17 +543,55 @@ async def upload_video(
                 # If not JSON, treat as comma-separated string
                 tags_list = [t.strip() for t in tags.split(',')]
         
-        # Create video upload record
+        # Save uploaded file using streaming (much faster for large files)
+        file_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
+        file_size_bytes = 0
+        async with aiofiles.open(file_path, "wb") as f:
+            # Stream file in chunks instead of loading entire file into memory
+            chunk_size = 1024 * 1024  # 1MB chunks
+            while chunk := await file.read(chunk_size):
+                await f.write(chunk)
+                file_size_bytes += len(chunk)
+        
+        file_size_mb = file_size_bytes / (1024 * 1024)
+        logger.info("File uploaded", job_id=job_id, filename=file.filename, size_mb=round(file_size_mb, 2))
+        
+        # Create minimal metadata (just file size for now, extract full metadata in background)
+        # Get mime type from extension
+        from pathlib import Path
+        extension = Path(file_path).suffix.lower()
+        mime_types = {
+            '.mp4': 'video/mp4',
+            '.avi': 'video/x-msvideo',
+            '.mov': 'video/quicktime',
+            '.mkv': 'video/x-matroska',
+            '.webm': 'video/webm',
+            '.flv': 'video/x-flv',
+            '.wmv': 'video/x-ms-wmv',
+            '.m4v': 'video/x-m4v'
+        }
+        mime_type = mime_types.get(extension, 'video/unknown')
+        
+        minimal_metadata = {
+            "video_size_bytes": file_size_bytes,
+            "mime_type": mime_type,
+            "video_length_seconds": None,
+            "resolution_width": None,
+            "resolution_height": None,
+            "fps": None
+        }
+        
+        # Create video upload record with minimal metadata
         video_upload = await VideoUploadService.create_upload(
             db=db,
             user_id=current_user.id,
             name=video_name,
             source_type="upload",
-            video_url=str(file_path),  # Store local path, can be S3 URL in production
+            video_url=str(file_path),
             original_input=file.filename or "unknown",
             status="uploaded",
             job_id=job_id,
-            metadata=metadata,
+            metadata=minimal_metadata,
             application_name=application_name,
             tags=tags_list,
             language_code=language_code,
@@ -579,10 +605,12 @@ async def upload_video(
             "message": "Video uploaded, starting processing...",
             "current_step": "upload",
             "step_progress": {
-                "upload": "processing",
-                "analyze": "pending",
+                "upload": "completed",
+                "extract_audio": "pending",
+                "transcribe": "pending",
                 "extract_frames": "pending",
-                "process": "pending"
+                "analyze_frames": "pending",
+                "complete": "pending"
             }
         }
         
@@ -591,22 +619,30 @@ async def upload_video(
         # Update upload status to processing
         await VideoUploadService.update_upload_status(db, video_upload.id, "processing", job_id)
         
-        # Log activity
-        await ActivityService.log_activity(
-            db=db,
-            user_id=current_user.id,
-            action="UPLOAD_VIDEO",
-            description=f"User uploaded video: {video_name}",
-            metadata={
-                "upload_id": str(video_upload.id),
-                "job_id": job_id,
-                "filename": file.filename,
-                "size_bytes": metadata.get("video_size_bytes")
-            },
-            ip_address=get_client_ip(request)
+        # Log activity in background (non-blocking)
+        background_tasks.add_task(
+            log_upload_activity,
+            current_user.id,
+            video_name,
+            str(video_upload.id),
+            job_id,
+            file.filename,
+            file_size_bytes,
+            get_client_ip(request)
         )
         
-        # Start background processing (complete pipeline: upload -> transcribe -> extract frames -> analyze with GPT -> store in DB)
+        # Extract full metadata in background and update record
+        background_tasks.add_task(
+            extract_and_update_metadata,
+            str(file_path),
+            video_upload.id
+        )
+        
+        # Start background processing (complete pipeline: extract audio -> transcribe -> extract frames -> analyze with GPT -> store in DB)
+        logger.info("Starting background video processing task", 
+                   job_id=job_id, 
+                   upload_id=str(video_upload.id),
+                   file_path=str(file_path))
         background_tasks.add_task(process_video_task, str(file_path), job_id, str(video_upload.id))
         
         return VideoUploadResponse.model_validate(video_upload)
@@ -923,6 +959,72 @@ async def restore_upload(
     )
     
     return VideoUploadResponse.model_validate(upload)
+
+
+@app.post("/api/uploads/{upload_id}/retry", response_model=VideoUploadResponse)
+async def retry_upload(
+    request: Request,
+    upload_id: UUID,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Retry processing for a failed video upload"""
+    upload = await VideoUploadService.get_upload(db, upload_id, current_user.id)
+    
+    if not upload:
+        raise HTTPException(status_code=404, detail="Video upload not found")
+    
+    if upload.status != "failed":
+        raise HTTPException(status_code=400, detail="Can only retry failed uploads")
+    
+    # Verify video file exists
+    video_path = Path(upload.video_url)
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    # Generate new job ID
+    import uuid
+    new_job_id = str(uuid.uuid4())
+    
+    # Initialize job status
+    initial_status = {
+        "status": "processing",
+        "progress": 0,
+        "message": "Retrying video processing...",
+        "current_step": "upload",
+        "step_progress": {
+            "upload": "completed",
+            "extract_audio": "pending",
+            "transcribe": "pending",
+            "extract_frames": "pending",
+            "analyze_frames": "pending",
+            "complete": "pending"
+        }
+    }
+    
+    await JobService.create_job(db, new_job_id, initial_status)
+    
+    # Update upload status to processing
+    await VideoUploadService.update_upload_status(db, upload_id, "processing", new_job_id)
+    
+    # Log activity
+    await ActivityService.log_activity(
+        db=db,
+        user_id=current_user.id,
+        action="RETRY_VIDEO_PROCESSING",
+        description=f"User retried video processing: {upload_id}",
+        metadata={"upload_id": str(upload_id), "job_id": new_job_id},
+        ip_address=get_client_ip(request)
+    )
+    
+    # Start background processing
+    background_tasks.add_task(process_video_task, str(video_path), new_job_id, str(upload_id))
+    
+    # Refresh upload to get updated job_id
+    updated_upload = await VideoUploadService.get_upload(db, upload_id, current_user.id)
+    
+    return VideoUploadResponse.model_validate(updated_upload)
 
 
 # Frame Analysis endpoints
@@ -1301,6 +1403,76 @@ async def get_document_by_file_number(
     )
 
 
+async def log_upload_activity(
+    user_id: UUID,
+    video_name: str,
+    upload_id: str,
+    job_id: str,
+    filename: Optional[str],
+    file_size_bytes: int,
+    ip_address: Optional[str]
+):
+    """Background task to log upload activity"""
+    from app.database import AsyncSessionLocal
+    
+    async with AsyncSessionLocal() as db:
+        try:
+            await ActivityService.log_activity(
+                db=db,
+                user_id=user_id,
+                action="UPLOAD_VIDEO",
+                description=f"User uploaded video: {video_name}",
+                metadata={
+                    "upload_id": upload_id,
+                    "job_id": job_id,
+                    "filename": filename,
+                    "size_bytes": file_size_bytes
+                },
+                ip_address=ip_address
+            )
+        except Exception as e:
+            logger.error("Failed to log upload activity", 
+                       upload_id=upload_id, 
+                       error=str(e))
+
+
+async def extract_and_update_metadata(video_path: str, upload_id: UUID):
+    """Background task to extract full video metadata and update the record"""
+    from app.database import AsyncSessionLocal
+    
+    async with AsyncSessionLocal() as db:
+        try:
+            # Extract full metadata
+            metadata = VideoMetadataService.extract_metadata(video_path)
+            
+            # Update video upload record with full metadata
+            from sqlalchemy import update
+            from app.database import VideoUpload
+            
+            await db.execute(
+                update(VideoUpload)
+                .where(VideoUpload.id == upload_id)
+                .values(
+                    video_length_seconds=metadata.get("video_length_seconds"),
+                    video_size_bytes=metadata.get("video_size_bytes"),
+                    mime_type=metadata.get("mime_type"),
+                    resolution_width=metadata.get("resolution_width"),
+                    resolution_height=metadata.get("resolution_height"),
+                    fps=metadata.get("fps")
+                )
+            )
+            await db.commit()
+            
+            logger.info("Video metadata updated", 
+                       upload_id=str(upload_id),
+                       metadata=metadata)
+        except Exception as e:
+            logger.error("Failed to extract and update metadata", 
+                       upload_id=str(upload_id), 
+                       error=str(e),
+                       exc_info=True)
+
+
 async def process_video_task(file_path: str, job_id: str, upload_id: Optional[str] = None):
     """
     Production-ready background task to process video:
@@ -1312,30 +1484,55 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
     from app.database import AsyncSessionLocal
     from app.services.video_processing_service import VideoProcessingService
     
+    logger.info("Background video processing task started", 
+               job_id=job_id, 
+               upload_id=upload_id,
+               file_path=file_path)
+    
+    # Verify file exists
+    if not Path(file_path).exists():
+        logger.error("Video file not found", job_id=job_id, file_path=file_path)
+        async with AsyncSessionLocal() as db:
+            await JobService.update_job(db, job_id, {
+                "status": "failed",
+                "message": f"Video file not found: {file_path}",
+                "error": "File not found"
+            })
+        return
+    
     async with AsyncSessionLocal() as db:
         try:
-            # Initialize processing service
-            processing_service = VideoProcessingService()
-            
-            # Step 1: Mark upload as complete
+            # Immediately update job status to show processing has started
+            logger.info("Updating job status to show processing started", job_id=job_id)
             await JobService.update_job(db, job_id, {
                 "progress": 5,
                 "message": "Video uploaded successfully. Starting processing...",
-                "current_step": "upload",
+                "current_step": "extract_audio",
                 "step_progress": {
                     "upload": "completed",
+                    "extract_audio": "pending",
                     "transcribe": "pending",
                     "extract_frames": "pending",
                     "analyze_frames": "pending",
                     "complete": "pending"
                 }
             })
+            logger.info("Job status updated successfully", job_id=job_id)
+            
+            # Initialize processing service
+            processing_service = VideoProcessingService()
+            logger.info("Video processing service initialized", job_id=job_id)
             
             # Convert upload_id to UUID if provided
             video_uuid = None
             if upload_id:
                 from uuid import UUID
-                video_uuid = UUID(upload_id)
+                try:
+                    video_uuid = UUID(upload_id)
+                    logger.info("Converted upload_id to UUID", upload_id=upload_id, video_uuid=str(video_uuid))
+                except ValueError as e:
+                    logger.error("Invalid upload_id format", upload_id=upload_id, error=str(e))
+                    raise ValueError(f"Invalid upload_id format: {upload_id}")
             
             if not video_uuid:
                 raise ValueError("Video upload ID is required for processing")

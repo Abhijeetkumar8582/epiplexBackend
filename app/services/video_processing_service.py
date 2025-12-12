@@ -29,16 +29,16 @@ class VideoProcessingService:
         self.audio_extractor = AudioExtractionService()
         self.batch_size = 5  # Process 5 frames at a time
     
-    async def extract_audio_and_transcribe(
+    async def extract_audio(
         self,
         video_path: str,
         video_id: UUID,
         job_id: str,
         audio_dir: Path,
         db: AsyncSession
-    ) -> Tuple[str, Optional[str]]:
+    ) -> str:
         """
-        Step 2: Extract audio from video, save it, and transcribe using OpenAI Whisper API
+        Step 2: Extract audio from video and save it
         
         Args:
             video_path: Path to video file
@@ -48,16 +48,167 @@ class VideoProcessingService:
             db: Database session
             
         Returns:
-            Tuple of (transcript text, audio_file_path)
+            Path to extracted audio file
+        """
+        try:
+            # Verify video file exists
+            from pathlib import Path
+            video_file = Path(video_path)
+            if not video_file.exists():
+                error_msg = f"Video file not found: {video_path}"
+                logger.error(error_msg, job_id=job_id, video_path=video_path)
+                await JobService.update_job(db, job_id, {
+                    "status": "failed",
+                    "message": error_msg,
+                    "error": error_msg,
+                    "current_step": "extract_audio"
+                })
+                raise FileNotFoundError(error_msg)
+            
+            # Update job status to show we're starting
+            await JobService.update_job(db, job_id, {
+                "progress": 10,
+                "message": "Extracting audio from video...",
+                "current_step": "extract_audio",
+                "step_progress": {
+                    "upload": "completed",
+                    "extract_audio": "processing",
+                    "transcribe": "pending",
+                    "extract_frames": "pending",
+                    "analyze_frames": "pending",
+                    "complete": "pending"
+                }
+            })
+            
+            logger.info("Starting audio extraction", 
+                       job_id=job_id, 
+                       video_path=video_path,
+                       video_id=str(video_id),
+                       audio_dir=str(audio_dir))
+            
+            # Extract audio from video
+            try:
+                audio_path = await self.audio_extractor.extract_audio_async(
+                    video_path=video_path,
+                    output_dir=audio_dir,
+                    video_id=str(video_id),
+                    audio_format="mp3"
+                )
+            except Exception as extract_error:
+                error_msg = f"Audio extraction error: {str(extract_error)}"
+                logger.error("Audio extraction service failed", 
+                            job_id=job_id, 
+                            error=str(extract_error),
+                            exc_info=True)
+                await JobService.update_job(db, job_id, {
+                    "status": "failed",
+                    "message": error_msg,
+                    "error": str(extract_error),
+                    "current_step": "extract_audio"
+                })
+                raise RuntimeError(error_msg) from extract_error
+            
+            if not audio_path:
+                error_msg = "Audio extraction returned None - extraction failed"
+                logger.error(error_msg, job_id=job_id, video_path=video_path)
+                await JobService.update_job(db, job_id, {
+                    "status": "failed",
+                    "message": error_msg,
+                    "error": error_msg,
+                    "current_step": "extract_audio"
+                })
+                raise ValueError(error_msg)
+            
+            # Verify audio file exists
+            audio_file = Path(audio_path)
+            if not audio_file.exists():
+                error_msg = f"Extracted audio file not found: {audio_path}"
+                logger.error(error_msg, job_id=job_id, audio_path=audio_path)
+                await JobService.update_job(db, job_id, {
+                    "status": "failed",
+                    "message": error_msg,
+                    "error": error_msg,
+                    "current_step": "extract_audio"
+                })
+                raise FileNotFoundError(error_msg)
+            
+            # Save audio path to video upload
+            try:
+                from app.services.video_upload_service import VideoUploadService
+                await VideoUploadService.update_upload_audio(db, video_id, audio_path)
+                logger.info("Audio URL saved to database", 
+                           job_id=job_id, 
+                           video_id=str(video_id),
+                           audio_path=audio_path)
+            except Exception as db_error:
+                logger.warning("Failed to save audio URL to database, continuing anyway",
+                             job_id=job_id,
+                             error=str(db_error))
+                # Don't fail the whole process if DB update fails
+            
+            # Update job status
+            await JobService.update_job(db, job_id, {
+                "progress": 20,
+                "message": "Audio extraction completed successfully",
+                "step_progress": {
+                    "upload": "completed",
+                    "extract_audio": "completed",
+                    "transcribe": "pending",
+                    "extract_frames": "pending",
+                    "analyze_frames": "pending",
+                    "complete": "pending"
+                }
+            })
+            
+            logger.info("Audio extraction completed successfully", 
+                       job_id=job_id, 
+                       audio_path=audio_path,
+                       video_id=str(video_id))
+            
+            return audio_path
+                        
+        except (FileNotFoundError, ValueError, RuntimeError) as e:
+            # Re-raise known errors
+            raise
+        except Exception as e:
+            logger.error("Unexpected error in audio extraction", 
+                        job_id=job_id, 
+                        error=str(e), 
+                        exc_info=True)
+            await JobService.update_job(db, job_id, {
+                "status": "failed",
+                "message": f"Audio extraction failed: {str(e)}",
+                "error": str(e),
+                "current_step": "extract_audio"
+            })
+            raise RuntimeError(f"Audio extraction failed: {str(e)}") from e
+    
+    async def transcribe_audio(
+        self,
+        audio_path: str,
+        job_id: str,
+        db: AsyncSession
+    ) -> str:
+        """
+        Step 3: Transcribe audio using OpenAI Whisper API
+        
+        Args:
+            audio_path: Path to extracted audio file
+            job_id: Job ID for status updates
+            db: Database session
+            
+        Returns:
+            Transcript text
         """
         try:
             # Update job status
             await JobService.update_job(db, job_id, {
-                "progress": 15,
-                "message": "Extracting audio and transcribing...",
+                "progress": 25,
+                "message": "Transcribing audio...",
                 "current_step": "transcribe",
                 "step_progress": {
                     "upload": "completed",
+                    "extract_audio": "completed",
                     "transcribe": "processing",
                     "extract_frames": "pending",
                     "analyze_frames": "pending",
@@ -68,22 +219,11 @@ class VideoProcessingService:
             if not self.openai_client:
                 raise ValueError("OpenAI API key not configured")
             
-            logger.info("Starting audio extraction and transcription", 
+            logger.info("Starting transcription", 
                        job_id=job_id, 
-                       video_path=video_path)
+                       audio_path=audio_path)
             
-            # Step 1: Extract audio from video
-            audio_path = await self.audio_extractor.extract_audio_async(
-                video_path=video_path,
-                output_dir=audio_dir,
-                video_id=str(video_id),
-                audio_format="mp3"
-            )
-            
-            if not audio_path:
-                raise ValueError("Failed to extract audio from video")
-            
-            # Step 2: Transcribe using OpenAI Whisper (use extracted audio file)
+            # Transcribe using OpenAI Whisper
             with open(audio_path, 'rb') as audio_file:
                 transcript_response = await self.openai_client.audio.transcriptions.create(
                     model="whisper-1",
@@ -100,6 +240,7 @@ class VideoProcessingService:
                 "transcript": transcript,
                 "step_progress": {
                     "upload": "completed",
+                    "extract_audio": "completed",
                     "transcribe": "completed",
                     "extract_frames": "pending",
                     "analyze_frames": "pending",
@@ -109,10 +250,9 @@ class VideoProcessingService:
             
             logger.info("Transcription completed", 
                        job_id=job_id, 
-                       transcript_length=len(transcript),
-                       audio_path=audio_path)
+                       transcript_length=len(transcript))
             
-            return transcript, audio_path
+            return transcript
                         
         except Exception as e:
             logger.error("Transcription failed", 
@@ -155,6 +295,7 @@ class VideoProcessingService:
                 "current_step": "extract_frames",
                 "step_progress": {
                     "upload": "completed",
+                    "extract_audio": "completed",
                     "transcribe": "completed",
                     "extract_frames": "processing",
                     "analyze_frames": "pending",
@@ -191,6 +332,7 @@ class VideoProcessingService:
                 "message": f"Extracted {len(frames)} keyframes. Starting GPT analysis...",
                 "step_progress": {
                     "upload": "completed",
+                    "extract_audio": "completed",
                     "transcribe": "completed",
                     "extract_frames": "completed",
                     "analyze_frames": "processing",
@@ -259,7 +401,15 @@ class VideoProcessingService:
                 await JobService.update_job(db, job_id, {
                     "progress": progress,
                     "message": f"Analyzing frames with GPT 4o Mini: batch {batch_num}/{total_batches} ({batch_start+1}-{batch_end}/{total_frames})",
-                    "current_step": "analyze_frames"
+                    "current_step": "analyze_frames",
+                    "step_progress": {
+                        "upload": "completed",
+                        "extract_audio": "completed",
+                        "transcribe": "completed",
+                        "extract_frames": "completed",
+                        "analyze_frames": "processing",
+                        "complete": "pending"
+                    }
                 })
                 
                 # Analyze batch with GPT
@@ -342,10 +492,11 @@ class VideoProcessingService:
     ) -> Dict[str, Any]:
         """
         Complete video processing pipeline:
-        1. Extract audio and transcribe
-        2. Extract keyframes (1 per second)
-        3. Process frames in batches of 5 through GPT 4o Mini
-        4. Store everything in database
+        1. Extract audio from video
+        2. Transcribe audio using OpenAI Whisper
+        3. Extract keyframes (1 per second)
+        4. Process frames in batches of 5 through GPT 4o Mini
+        5. Store everything in database
         
         Args:
             video_path: Path to video file
@@ -362,8 +513,8 @@ class VideoProcessingService:
                        job_id=job_id, 
                        video_id=str(video_id))
             
-            # Step 1: Extract audio and transcribe
-            transcript, audio_path = await self.extract_audio_and_transcribe(
+            # Step 1: Extract audio from video
+            audio_path = await self.extract_audio(
                 video_path=video_path,
                 video_id=video_id,
                 job_id=job_id,
@@ -371,11 +522,14 @@ class VideoProcessingService:
                 db=db
             )
             
-            # Save audio path to video upload
-            from app.services.video_upload_service import VideoUploadService
-            await VideoUploadService.update_upload_audio(db, video_id, audio_path)
+            # Step 2: Transcribe audio
+            transcript = await self.transcribe_audio(
+                audio_path=audio_path,
+                job_id=job_id,
+                db=db
+            )
             
-            # Step 2: Extract keyframes
+            # Step 3: Extract keyframes
             frames = await self.extract_keyframes(
                 video_path=video_path,
                 video_id=video_id,
@@ -387,7 +541,7 @@ class VideoProcessingService:
             if not frames:
                 raise ValueError("No frames extracted from video")
             
-            # Step 3: Process frames in batches and store in database
+            # Step 4: Process frames in batches and store in database
             frame_analyses = await self.process_frames_with_gpt_batch(
                 frames=frames,
                 video_id=video_id,
@@ -395,7 +549,7 @@ class VideoProcessingService:
                 db=db
             )
             
-            # Step 4: Mark as completed
+            # Step 5: Mark as completed
             await JobService.update_job(db, job_id, {
                 "status": "completed",
                 "progress": 100,
@@ -403,6 +557,7 @@ class VideoProcessingService:
                 "current_step": "complete",
                 "step_progress": {
                     "upload": "completed",
+                    "extract_audio": "completed",
                     "transcribe": "completed",
                     "extract_frames": "completed",
                     "analyze_frames": "completed",

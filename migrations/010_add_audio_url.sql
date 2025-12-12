@@ -20,4 +20,3 @@ BEGIN
     PRINT 'Column audio_url already exists in video_uploads table';
 END
 GO
-
