@@ -14,7 +14,8 @@ from app.models.video_schemas import (
     VideoUploadCreate,
     VideoUploadResponse,
     VideoUploadListResponse,
-    VideoUploadUpdate
+    VideoUploadUpdate,
+    BulkDeleteRequest
 )
 
 # Job processing schemas
@@ -62,6 +63,7 @@ __all__ = [
     "VideoUploadResponse",
     "VideoUploadListResponse",
     "VideoUploadUpdate",
+    "BulkDeleteRequest",
     # Job schemas
     "ProcessingStatus",
     "ProcessingResult",

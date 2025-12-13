@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Request, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -28,9 +29,10 @@ from app.services.google_oauth_service import GoogleOAuthService
 from app.services.video_upload_service import VideoUploadService
 from app.services.video_metadata_service import VideoMetadataService
 from app.services.frame_analysis_service import FrameAnalysisService
+from app.services.summary_service import SummaryService
 from app.models import (
     UserSignup, UserLogin, SignupResponse, LoginResponse, UserResponse,
-    VideoUploadCreate, VideoUploadResponse, VideoUploadListResponse, VideoUploadUpdate,
+    VideoUploadCreate, VideoUploadResponse, VideoUploadListResponse, VideoUploadUpdate, BulkDeleteRequest,
     FrameAnalysisResponse, FrameAnalysisListResponse,
     ActivityLogResponse, ActivityLogListResponse, ActivityLogStatsResponse,
     DocumentResponse, VideoMetadata, FrameData,
@@ -90,6 +92,9 @@ app = FastAPI(
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url="/redoc" if settings.DEBUG else None,
 )
+
+# Compression middleware (should be added before CORS)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # CORS middleware
 app.add_middleware(
@@ -610,6 +615,8 @@ async def upload_video(
                 "transcribe": "pending",
                 "extract_frames": "pending",
                 "analyze_frames": "pending",
+                "summary_generation": "pending",
+                "generate_pdf": "pending",
                 "complete": "pending"
             }
         }
@@ -933,6 +940,57 @@ async def delete_upload(
     return {"message": message}
 
 
+@app.post("/api/uploads/bulk-delete")
+async def bulk_delete_uploads(
+    request: Request,
+    delete_request: BulkDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Bulk delete multiple video uploads"""
+    if not delete_request.upload_ids:
+        raise HTTPException(status_code=400, detail="No upload IDs provided")
+    
+    # Convert string IDs to UUIDs
+    try:
+        upload_uuids = [UUID(uid) for uid in delete_request.upload_ids]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid upload ID format: {str(e)}")
+    
+    deleted_count, failed_count = await VideoUploadService.bulk_delete_uploads(
+        db=db,
+        upload_ids=upload_uuids,
+        user_id=current_user.id,
+        permanent=delete_request.permanent
+    )
+    
+    # Log activity
+    action = "BULK_HARD_DELETE_VIDEO" if delete_request.permanent else "BULK_DELETE_VIDEO"
+    await ActivityService.log_activity(
+        db=db,
+        user_id=current_user.id,
+        action=action,
+        description=f"User bulk deleted {deleted_count} video upload(s)",
+        metadata={
+            "upload_ids": delete_request.upload_ids,
+            "deleted_count": deleted_count,
+            "failed_count": failed_count,
+            "permanent": delete_request.permanent
+        },
+        ip_address=get_client_ip(request)
+    )
+    
+    message = f"Successfully deleted {deleted_count} upload(s)"
+    if failed_count > 0:
+        message += f", {failed_count} failed"
+    
+    return {
+        "message": message,
+        "deleted_count": deleted_count,
+        "failed_count": failed_count
+    }
+
+
 @app.post("/api/uploads/{upload_id}/restore", response_model=VideoUploadResponse)
 async def restore_upload(
     request: Request,
@@ -1159,7 +1217,7 @@ async def get_activity_logs(
         search=search
     )
     
-    return ActivityLogListResponse(
+    response_data = ActivityLogListResponse(
         logs=[ActivityLogResponse(
             id=log.id,
             user_id=str(log.user_id),
@@ -1172,6 +1230,18 @@ async def get_activity_logs(
         total=total,
         page=page,
         page_size=page_size
+    )
+    
+    # Add cache headers for better performance
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content=response_data.model_dump(),
+        headers={
+            "Cache-Control": "private, max-age=60",  # Cache for 1 minute
+            "X-Total-Count": str(total),
+            "X-Page": str(page),
+            "X-Page-Size": str(page_size)
+        }
     )
 
 
@@ -1379,6 +1449,7 @@ async def get_document_by_file_number(
             language_code=upload.language_code,
             priority=upload.priority,
             audio_url=upload.audio_url,
+            summary_pdf_url=upload.summary_pdf_url,
             created_at=upload.created_at,
             updated_at=upload.updated_at
         ),
@@ -1399,8 +1470,213 @@ async def get_document_by_file_number(
         ],
         summary=document_data["summary"],
         transcript=transcript,
+        summary_pdf_url=upload.summary_pdf_url,
         created_at=datetime.utcnow()
     )
+
+
+@app.get("/api/videos/{video_id}/summaries")
+async def get_video_summaries(
+    video_id: UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get all summaries for a video
+    
+    Returns list of batch summaries generated from frame analyses.
+    """
+    try:
+        # Verify video belongs to user
+        from app.services.video_upload_service import VideoUploadService
+        video_upload = await VideoUploadService.get_upload(db, video_id, current_user.id)
+        
+        if not video_upload:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get summaries
+        summary_service = SummaryService()
+        summaries = await summary_service.get_video_summaries(db, video_id)
+        
+        # Log activity
+        await ActivityService.log_activity(
+            db=db,
+            user_id=current_user.id,
+            action="FETCH_SUMMARIES",
+            description=f"User fetched summaries for video: {video_upload.video_file_number}",
+            metadata={
+                "video_id": str(video_id),
+                "video_file_number": video_upload.video_file_number,
+                "total_summaries": len(summaries)
+            },
+            ip_address=get_client_ip(request)
+        )
+        
+        return {
+            "video_id": str(video_id),
+            "video_file_number": video_upload.video_file_number,
+            "total_summaries": len(summaries),
+            "summaries": summaries
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to get video summaries",
+                   video_id=str(video_id),
+                   error=str(e),
+                   exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get summaries: {str(e)}")
+
+
+@app.post("/api/videos/{video_id}/summaries/generate")
+async def generate_video_summaries(
+    video_id: UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Manually trigger summary generation for a video
+    
+    This will process all frame analyses in batches of 30 and generate summaries.
+    """
+    try:
+        # Verify video belongs to user
+        from app.services.video_upload_service import VideoUploadService
+        video_upload = await VideoUploadService.get_upload(db, video_id, current_user.id)
+        
+        if not video_upload:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Generate summaries
+        summary_service = SummaryService()
+        summaries = await summary_service.generate_video_summaries(db, video_id)
+        
+        # Log activity
+        await ActivityService.log_activity(
+            db=db,
+            user_id=current_user.id,
+            action="GENERATE_SUMMARIES",
+            description=f"User generated summaries for video: {video_upload.video_file_number}",
+            metadata={
+                "video_id": str(video_id),
+                "video_file_number": video_upload.video_file_number,
+                "total_summaries": len(summaries)
+            },
+            ip_address=get_client_ip(request)
+        )
+        
+        return {
+            "video_id": str(video_id),
+            "video_file_number": video_upload.video_file_number,
+            "total_summaries": len(summaries),
+            "summaries": summaries,
+            "message": f"Successfully generated {len(summaries)} summaries"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to generate video summaries",
+                   video_id=str(video_id),
+                   error=str(e),
+                   exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate summaries: {str(e)}")
+
+
+@app.get("/api/videos/{video_id}/summary-pdf")
+async def download_summary_pdf(
+    video_id: UUID,
+    request: Request,
+    token: Optional[str] = Query(None, description="Optional token for iframe access"),
+    current_user: Optional[User] = Depends(lambda: None),  # Make optional for token-based access
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Download the generated summary PDF for a video
+    Supports both Bearer token and query parameter token for iframe access
+    """
+    try:
+        from app.services.video_upload_service import VideoUploadService
+        from app.services.auth_service import AuthService
+        
+        # Handle authentication - either from current_user or token parameter
+        user_id = None
+        if current_user:
+            user_id = current_user.id
+        elif token:
+            # Verify token and get user
+            try:
+                user_data = AuthService.verify_token(token)
+                if user_data:
+                    user_id = UUID(user_data.get("sub"))  # JWT sub claim contains user_id
+            except Exception as token_error:
+                logger.warning("Token verification failed", error=str(token_error))
+        
+        if not user_id:
+            # Try to get user from Authorization header if token param failed
+            auth_header = request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                try:
+                    token_from_header = auth_header.split(" ")[1]
+                    user_data = AuthService.verify_token(token_from_header)
+                    if user_data:
+                        user_id = UUID(user_data.get("sub"))
+                except Exception:
+                    pass
+        
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        
+        # Verify video belongs to user
+        video_upload = await VideoUploadService.get_upload(db, video_id, user_id)
+        
+        if not video_upload:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        if not video_upload.summary_pdf_url:
+            raise HTTPException(status_code=404, detail="Summary PDF not found for this video")
+        
+        # Get PDF path
+        pdf_path = Path(video_upload.summary_pdf_url)
+        
+        # If it's a relative path, resolve it relative to OUTPUT_DIR
+        if not pdf_path.is_absolute():
+            pdf_path = settings.OUTPUT_DIR / pdf_path
+        
+        if not pdf_path.exists():
+            raise HTTPException(status_code=404, detail="Summary PDF file not found on server")
+        
+        # Log activity
+        if user_id:
+            await ActivityService.log_activity(
+                db=db,
+                user_id=user_id,
+                action="DOWNLOAD_SUMMARY_PDF",
+                description=f"User downloaded summary PDF for video: {video_upload.video_file_number}",
+                metadata={
+                    "video_id": str(video_id),
+                    "video_file_number": video_upload.video_file_number
+                },
+                ip_address=get_client_ip(request)
+            )
+        
+        return FileResponse(
+            path=str(pdf_path),
+            filename=f"video_summary_{video_upload.video_file_number}.pdf",
+            media_type="application/pdf"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to download summary PDF",
+                   video_id=str(video_id),
+                   error=str(e),
+                   exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to download PDF: {str(e)}")
 
 
 async def log_upload_activity(

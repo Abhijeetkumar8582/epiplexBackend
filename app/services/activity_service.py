@@ -2,7 +2,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func, and_
 from typing import Optional, Dict, Any, List, Tuple
 from uuid import UUID
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.database import UserActivityLog, AsyncSessionLocal
 from app.utils.logger import logger
@@ -27,13 +27,16 @@ class ActivityService:
         # Use a separate session to avoid transaction conflicts
         async with AsyncSessionLocal() as activity_db:
             try:
+                # Always set current timestamp explicitly
+                current_timestamp = datetime.now(timezone.utc)
+                
                 activity = UserActivityLog(
                     user_id=user_id,
                     action=action,
                     description=description,
                     activity_metadata=metadata,
                     ip_address=ip_address,
-                    created_at=datetime.utcnow()
+                    created_at=current_timestamp
                 )
                 
                 activity_db.add(activity)
@@ -158,7 +161,7 @@ class ActivityService:
         days: int = 30
     ) -> Dict[str, Any]:
         """Get activity statistics for a user"""
-        start_date = datetime.utcnow() - timedelta(days=days)
+        start_date = datetime.now(timezone.utc) - timedelta(days=days)
         
         # Total activities
         total_query = select(func.count(UserActivityLog.id)).where(

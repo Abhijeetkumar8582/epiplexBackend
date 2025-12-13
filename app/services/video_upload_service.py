@@ -422,4 +422,46 @@ class VideoUploadService:
         
         logger.info("Video upload permanently deleted", upload_id=str(upload_id), user_id=str(user_id))
         return True
+    
+    @staticmethod
+    async def bulk_delete_uploads(
+        db: AsyncSession,
+        upload_ids: List[UUID],
+        user_id: UUID,
+        permanent: bool = False
+    ) -> Tuple[int, int]:
+        """
+        Bulk delete multiple video uploads
+        Returns: (deleted_count, failed_count)
+        """
+        if not upload_ids:
+            return (0, 0)
+        
+        deleted_count = 0
+        failed_count = 0
+        
+        for upload_id in upload_ids:
+            try:
+                if permanent:
+                    success = await VideoUploadService.hard_delete_upload(db, upload_id, user_id)
+                else:
+                    success = await VideoUploadService.soft_delete_upload(db, upload_id, user_id)
+                
+                if success:
+                    deleted_count += 1
+                else:
+                    failed_count += 1
+            except Exception as e:
+                logger.error("Failed to delete upload in bulk operation", 
+                           upload_id=str(upload_id), 
+                           error=str(e))
+                failed_count += 1
+        
+        logger.info("Bulk delete completed", 
+                   total_requested=len(upload_ids),
+                   deleted=deleted_count,
+                   failed=failed_count,
+                   user_id=str(user_id))
+        
+        return (deleted_count, failed_count)
 

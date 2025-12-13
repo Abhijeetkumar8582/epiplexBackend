@@ -225,9 +225,13 @@ class VideoUpload(Base):
     # Audio file path - extracted audio from video
     audio_url = Column(Text, nullable=True)  # Path to extracted audio file
     
+    # Summary PDF path - generated PDF with summaries and images
+    summary_pdf_url = Column(Text, nullable=True)  # Path to generated summary PDF
+    
     # Relationships
     user = relationship("User", back_populates="video_uploads")
     frame_analyses = relationship("FrameAnalysis", back_populates="video_upload", cascade="all, delete-orphan", order_by="FrameAnalysis.timestamp")
+    summaries = relationship("VideoSummary", back_populates="video_upload", cascade="all, delete-orphan", order_by="VideoSummary.batch_number")
 
 
 class FrameAnalysis(Base):
@@ -261,6 +265,33 @@ class FrameAnalysis(Base):
     
     # Relationships
     video_upload = relationship("VideoUpload", back_populates="frame_analyses")
+
+
+class VideoSummary(Base):
+    __tablename__ = "video_summaries"
+    
+    id = Column(UUIDType, primary_key=True, default=uuid_default)
+    video_id = Column(UUIDType, ForeignKey('video_uploads.id', ondelete='CASCADE'), nullable=False, index=True)
+    
+    # Summary metadata
+    batch_number = Column(Integer, nullable=False)
+    batch_start_frame = Column(Integer, nullable=False)
+    batch_end_frame = Column(Integer, nullable=False)
+    total_frames_in_batch = Column(Integer, nullable=False)
+    
+    # Summary content
+    summary_text = Column(Text, nullable=False)
+    summary_metadata = Column(Text, nullable=True)  # JSON string for additional metadata
+    
+    # Processing metadata
+    processing_time_ms = Column(Integer, nullable=True)
+    model_used = Column(String(50), nullable=True, default='gpt-4o-mini')
+    
+    # Timestamps
+    created_at = Column(TimestampType, nullable=False, server_default=func.now())
+    
+    # Relationships
+    video_upload = relationship("VideoUpload", back_populates="summaries")
 
 
 class JobStatus(Base):

@@ -88,6 +88,7 @@ class FrameAnalysisService:
                 gpt_response = {
                     "description": frame_data.get("description"),
                     "ocr_text": frame_data.get("ocr_text"),
+                    "meta_tags": frame_data.get("meta_tags"),  # Include meta_tags
                     "processing_time_ms": frame_data.get("processing_time_ms"),
                     "timestamp": frame_data.get("timestamp"),
                     "frame_number": frame_data.get("frame_number"),

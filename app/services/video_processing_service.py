@@ -76,6 +76,8 @@ class VideoProcessingService:
                     "transcribe": "pending",
                     "extract_frames": "pending",
                     "analyze_frames": "pending",
+                    "summary_generation": "pending",
+                    "generate_pdf": "pending",
                     "complete": "pending"
                 }
             })
@@ -156,6 +158,8 @@ class VideoProcessingService:
                     "transcribe": "pending",
                     "extract_frames": "pending",
                     "analyze_frames": "pending",
+                    "summary_generation": "pending",
+                    "generate_pdf": "pending",
                     "complete": "pending"
                 }
             })
@@ -212,6 +216,8 @@ class VideoProcessingService:
                     "transcribe": "processing",
                     "extract_frames": "pending",
                     "analyze_frames": "pending",
+                    "summary_generation": "pending",
+                    "generate_pdf": "pending",
                     "complete": "pending"
                 }
             })
@@ -244,6 +250,8 @@ class VideoProcessingService:
                     "transcribe": "completed",
                     "extract_frames": "pending",
                     "analyze_frames": "pending",
+                    "summary_generation": "pending",
+                    "generate_pdf": "pending",
                     "complete": "pending"
                 }
             })
@@ -299,6 +307,8 @@ class VideoProcessingService:
                     "transcribe": "completed",
                     "extract_frames": "processing",
                     "analyze_frames": "pending",
+                    "summary_generation": "pending",
+                    "generate_pdf": "pending",
                     "complete": "pending"
                 }
             })
@@ -336,6 +346,8 @@ class VideoProcessingService:
                     "transcribe": "completed",
                     "extract_frames": "completed",
                     "analyze_frames": "processing",
+                    "summary_generation": "pending",
+                    "generate_pdf": "pending",
                     "complete": "pending"
                 }
             })
@@ -425,6 +437,7 @@ class VideoProcessingService:
                     gpt_response = {
                         "description": frame_data.get("description"),
                         "ocr_text": frame_data.get("ocr_text"),
+                        "meta_tags": frame_data.get("meta_tags"),  # Include meta_tags
                         "processing_time_ms": frame_data.get("processing_time_ms"),
                         "timestamp": frame_data.get("timestamp"),
                         "frame_number": frame_data.get("frame_number"),
@@ -549,11 +562,72 @@ class VideoProcessingService:
                 db=db
             )
             
-            # Step 5: Mark as completed
+            # Step 5: Generate summaries in batches of 30
+            from app.services.summary_service import SummaryService
+            summary_service = SummaryService()
+            
+            logger.info("Starting summary generation", 
+                       job_id=job_id, 
+                       video_id=str(video_id))
+            
+            # Step 5: Generate summaries
+            await JobService.update_job(db, job_id, {
+                "progress": 85,
+                "message": "Generating summaries from frame analyses...",
+                "current_step": "summary_generation",
+                "step_progress": {
+                    "upload": "completed",
+                    "extract_audio": "completed",
+                    "transcribe": "completed",
+                    "extract_frames": "completed",
+                    "analyze_frames": "completed",
+                    "summary_generation": "processing",
+                    "generate_pdf": "pending",
+                    "complete": "pending"
+                }
+            })
+            
+            try:
+                summaries = await summary_service.generate_video_summaries(
+                    db=db,
+                    video_id=video_id,
+                    job_id=job_id
+                )
+                
+                logger.info("Summary generation completed",
+                           job_id=job_id,
+                           video_id=str(video_id),
+                           total_summaries=len(summaries))
+            except Exception as summary_error:
+                logger.error("Summary generation failed, continuing with PDF generation",
+                           job_id=job_id,
+                           video_id=str(video_id),
+                           error=str(summary_error))
+                # Don't fail the whole process if summary generation fails
+                summaries = []
+            
+            # Step 6: Generate PDF (PDF is already generated during summary generation, just update status)
+            await JobService.update_job(db, job_id, {
+                "progress": 95,
+                "message": "PDF generation completed...",
+                "current_step": "generate_pdf",
+                "step_progress": {
+                    "upload": "completed",
+                    "extract_audio": "completed",
+                    "transcribe": "completed",
+                    "extract_frames": "completed",
+                    "analyze_frames": "completed",
+                    "summary_generation": "completed",
+                    "generate_pdf": "completed",
+                    "complete": "pending"
+                }
+            })
+            
+            # Step 7: Mark as completed
             await JobService.update_job(db, job_id, {
                 "status": "completed",
                 "progress": 100,
-                "message": f"Processing completed successfully. Transcribed {len(transcript)} characters, analyzed {len(frame_analyses)} frames.",
+                "message": f"Processing completed successfully. Transcribed {len(transcript)} characters, analyzed {len(frame_analyses)} frames, generated {len(summaries)} summaries and PDF.",
                 "current_step": "complete",
                 "step_progress": {
                     "upload": "completed",
@@ -561,6 +635,8 @@ class VideoProcessingService:
                     "transcribe": "completed",
                     "extract_frames": "completed",
                     "analyze_frames": "completed",
+                    "summary_generation": "completed",
+                    "generate_pdf": "completed",
                     "complete": "completed"
                 }
             })

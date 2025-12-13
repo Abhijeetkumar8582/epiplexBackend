@@ -1,6 +1,7 @@
 """Real GPT-4 Vision service for frame analysis"""
 import base64
 import time
+import json
 from typing import Dict, Optional, List
 import numpy as np
 from pathlib import Path
@@ -18,13 +19,115 @@ class GPTService:
         """Initialize GPT service with OpenAI client"""
         self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY) if hasattr(settings, 'OPENAI_API_KEY') and settings.OPENAI_API_KEY else None
         
+        # Load prompt from file
+        self.prompt_template = self._load_prompt_template()
+        
         if not self.client:
             logger.warning("OpenAI API key not configured. GPT service will not work.")
+    
+    def _load_prompt_template(self) -> str:
+        """Load prompt template from prompt.txt file"""
+        try:
+            prompt_file = Path(__file__).parent.parent.parent / "prompt.txt"
+            logger.info("Loading prompt template", prompt_file=str(prompt_file))
+            if prompt_file.exists():
+                with open(prompt_file, 'r', encoding='utf-8') as f:
+                    prompt_content = f.read().strip()
+                    logger.info("Prompt template loaded successfully", 
+                              prompt_length=len(prompt_content),
+                              prompt_preview=prompt_content[:200])
+                    print(f"[GPT Service] Prompt loaded from: {prompt_file}")
+                    print(f"[GPT Service] Prompt length: {len(prompt_content)} characters")
+                    return prompt_content
+            else:
+                # Default prompt if file doesn't exist
+                logger.warning("prompt.txt not found, using default prompt", prompt_file=str(prompt_file))
+                print(f"[GPT Service] WARNING: prompt.txt not found at {prompt_file}")
+                return """Analyze this video frame and provide:
+1. A detailed description of what you see (UI elements, text, layout, etc.)
+2. Extract any visible text (OCR) from the frame
+3. Identify any important information or data displayed
+
+Frame timestamp: {timestamp} seconds"""
+        except Exception as e:
+            logger.error("Failed to load prompt template", error=str(e))
+            print(f"[GPT Service] ERROR loading prompt: {str(e)}")
+            return """Analyze this video frame and provide:
+1. A detailed description of what you see (UI elements, text, layout, etc.)
+2. Extract any visible text (OCR) from the frame
+3. Identify any important information or data displayed
+
+Frame timestamp: {timestamp} seconds"""
     
     def _encode_image(self, image_path: str) -> str:
         """Encode image to base64"""
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode('utf-8')
+    
+    def _strip_markdown_code_blocks(self, text: str) -> str:
+        """Strip markdown code blocks (```json ... ```) from text"""
+        import re
+        # Remove markdown code blocks
+        text = re.sub(r'```json\s*\n?', '', text)
+        text = re.sub(r'```\s*\n?', '', text)
+        # Also handle cases where there might be ``` at the start/end
+        text = text.strip()
+        if text.startswith('```'):
+            text = text[3:].strip()
+        if text.endswith('```'):
+            text = text[:-3].strip()
+        return text.strip()
+    
+    def _repair_json(self, json_str: str) -> str:
+        """Attempt to repair common JSON issues"""
+        import re
+        # Remove leading/trailing whitespace and newlines
+        json_str = json_str.strip()
+        
+        # If empty, return empty
+        if not json_str:
+            return "{}"
+        
+        # Remove any leading newlines, spaces, or other whitespace
+        json_str = json_str.lstrip('\n\r\t ')
+        
+        # If it doesn't start with {, try to find the JSON object
+        if not json_str.startswith('{'):
+            # Find first {
+            start = json_str.find('{')
+            if start != -1:
+                json_str = json_str[start:]
+            else:
+                # No { found - might be just JSON content without braces
+                # Check if it looks like JSON key-value pairs
+                if '"' in json_str or 'timestamp' in json_str.lower() or 'description' in json_str.lower():
+                    # Wrap in braces
+                    json_str = '{' + json_str
+                    # Try to add closing brace if missing
+                    if json_str.count('{') > json_str.count('}'):
+                        json_str = json_str + '}'
+        
+        # If it doesn't end with }, try to find the end
+        if not json_str.endswith('}'):
+            # Find last }
+            end = json_str.rfind('}')
+            if end != -1:
+                json_str = json_str[:end + 1]
+            else:
+                # No } found - try to add it if we have an opening brace
+                if json_str.startswith('{') and json_str.count('{') > json_str.count('}'):
+                    json_str = json_str + '}'
+        
+        # Remove any trailing newlines or whitespace
+        json_str = json_str.rstrip('\n\r\t ')
+        
+        # Final check - ensure it starts with { and ends with }
+        if not json_str.startswith('{'):
+            json_str = '{' + json_str
+        if not json_str.endswith('}'):
+            json_str = json_str + '}'
+        
+        return json_str.strip()
     
     async def analyze_frame(
         self,
@@ -54,21 +157,27 @@ class GPTService:
                 image_data = await f.read()
                 base64_image = base64.b64encode(image_data).decode('utf-8')
             
+            # Format prompt with timestamp
+            prompt_text = self.prompt_template.format(timestamp=timestamp_seconds)
+            print(f"[GPT Service] Formatted prompt for timestamp: {timestamp_seconds}")
+            print(f"[GPT Service] Prompt text length: {len(prompt_text)} characters")
+            print(f"[GPT Service] Prompt preview: {prompt_text[:300]}...")
+            
+            # Always request JSON since our prompt explicitly asks for JSON format
+            # The prompt.txt file specifies "strict JSON response"
+            request_json = True  # Always true since prompt.txt requires JSON
+            print(f"[GPT Service] Requesting JSON format: {request_json}")
+            
             # Call GPT-4 Vision API
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",  # or "gpt-4-vision-preview" for better results
-                messages=[
+            api_params = {
+                "model": "gpt-4o-mini",
+                "messages": [
                     {
                         "role": "user",
                         "content": [
                             {
                                 "type": "text",
-                                "text": """Analyze this video frame and provide:
-1. A detailed description of what you see (UI elements, text, layout, etc.)
-2. Extract any visible text (OCR) from the frame
-3. Identify any important information or data displayed
-
-Frame timestamp: {:.2f} seconds""".format(timestamp_seconds)
+                                "text": prompt_text
                             },
                             {
                                 "type": "image_url",
@@ -79,43 +188,199 @@ Frame timestamp: {:.2f} seconds""".format(timestamp_seconds)
                         ]
                     }
                 ],
-                max_tokens=500
-            )
+                "max_tokens": 1000
+            }
+            
+            # Only request JSON if prompt explicitly asks for it
+            if request_json:
+                api_params["response_format"] = {"type": "json_object"}
+                print(f"[GPT Service] Added response_format: json_object to API params")
+            
+            print(f"[GPT Service] Making API call to GPT-4o-mini...")
+            print(f"[GPT Service] Image path: {image_path}")
+            print(f"[GPT Service] Image size: {len(base64_image)} base64 characters")
+            
+            response = await self.client.chat.completions.create(**api_params)
+            
+            print(f"[GPT Service] API call completed successfully")
             
             # Parse response
             content = response.choices[0].message.content
             
-            # Extract description and OCR text from response
-            # Simple parsing - you may want to improve this based on actual API response format
-            description = content
-            ocr_text = None
+            # Print and log raw response for debugging
+            print(f"[GPT Service] ========== GPT RESPONSE RECEIVED ==========")
+            print(f"[GPT Service] Response length: {len(content) if content else 0} characters")
+            print(f"[GPT Service] Full response content:")
+            print(content)
+            print(f"[GPT Service] ============================================")
             
-            # Try to extract OCR text if mentioned in response
-            if "Text found:" in content or "OCR:" in content:
-                # Simple extraction - adjust based on actual response format
-                lines = content.split('\n')
-                ocr_lines = []
-                in_ocr_section = False
-                for line in lines:
-                    if "Text found:" in line or "OCR:" in line:
-                        in_ocr_section = True
-                        continue
-                    if in_ocr_section and line.strip():
-                        ocr_lines.append(line.strip())
-                    elif in_ocr_section and not line.strip():
-                        break
-                ocr_text = '\n'.join(ocr_lines) if ocr_lines else None
+            logger.warning("Raw GPT response received",
+                        content_preview=content[:500] if content else "None",
+                        content_length=len(content) if content else 0,
+                        timestamp=timestamp_seconds)
+            
+            # Initialize defaults
+            description = ""
+            ocr_text = None
+            meta_tags = []
+            
+            # Since we're using response_format: {"type": "json_object"}, 
+            # OpenAI should return valid JSON. Parse it directly.
+            try:
+                # Content should be valid JSON, but strip whitespace just in case
+                content_cleaned = content.strip() if content else ""
+                
+                if not content_cleaned:
+                    raise ValueError("Empty response from GPT API")
+                
+                # Try direct JSON parse first (should work with response_format)
+                print(f"[GPT Service] Attempting to parse JSON response...")
+                print(f"[GPT Service] Content to parse (first 200 chars): {content_cleaned[:200]}")
+                try:
+                    json_response = json.loads(content_cleaned)
+                    print(f"[GPT Service] ✓ Direct JSON parse succeeded!")
+                except json.JSONDecodeError as parse_err:
+                    # If direct parse fails, try stripping markdown and repairing
+                    print(f"[GPT Service] ✗ Direct JSON parse failed: {str(parse_err)}")
+                    print(f"[GPT Service] Attempting repair...")
+                    logger.warning("Direct JSON parse failed, attempting repair",
+                                content_preview=content_cleaned[:200],
+                                error=str(parse_err))
+                    content_cleaned = self._strip_markdown_code_blocks(content_cleaned).strip()
+                    
+                    # Extract JSON object if embedded
+                    json_start = content_cleaned.find('{')
+                    json_end = content_cleaned.rfind('}')
+                    
+                    if json_start != -1 and json_end != -1 and json_end > json_start:
+                        json_str = content_cleaned[json_start:json_end + 1]
+                        print(f"[GPT Service] Extracted JSON from position {json_start} to {json_end}")
+                    else:
+                        json_str = content_cleaned
+                        print(f"[GPT Service] Using full content as JSON string")
+                    
+                    # Repair and parse
+                    print(f"[GPT Service] Repairing JSON string...")
+                    json_str = self._repair_json(json_str)
+                    print(f"[GPT Service] Repaired JSON (first 200 chars): {json_str[:200]}")
+                    json_response = json.loads(json_str)
+                    print(f"[GPT Service] ✓ JSON parse succeeded after repair!")
+                    
+                # Extract fields from JSON response according to prompt format
+                # Expected format: {"timestamp": number, "description": string, "meta_tags": [string, string, string]}
+                if not isinstance(json_response, dict):
+                    raise ValueError(f"JSON response is not a dictionary, got {type(json_response).__name__}")
+                
+                # Get description (required field)
+                description = json_response.get("description", "")
+                if not description or not isinstance(description, str):
+                    logger.warning("Missing or invalid description in GPT response", 
+                                json_keys=list(json_response.keys()),
+                                description_type=type(json_response.get("description")).__name__ if "description" in json_response else "missing")
+                    description = description if description else "No description provided"
+                
+                # Get meta_tags (required field, should be array of exactly 3)
+                meta_tags = json_response.get("meta_tags", [])
+                if not isinstance(meta_tags, list):
+                    logger.warning("meta_tags is not a list", 
+                                meta_tags_type=type(meta_tags).__name__,
+                                meta_tags_value=meta_tags)
+                    meta_tags = []
+                elif len(meta_tags) != 3:
+                    logger.warning("meta_tags should have exactly 3 items", 
+                                meta_tags_count=len(meta_tags),
+                                meta_tags=meta_tags)
+                    # Keep what we have, but log the issue
+                
+                # Get timestamp from response (optional, prompt asks for it)
+                if "timestamp" in json_response:
+                    response_ts = json_response.get("timestamp")
+                    if isinstance(response_ts, (int, float)):
+                        timestamp_seconds = float(response_ts)
+                    else:
+                        logger.warning("Timestamp in response is not a number", 
+                                    timestamp_type=type(response_ts).__name__)
+                
+                # OCR text is not in the prompt format, but check just in case
+                ocr_text = json_response.get("ocr_text") or json_response.get("text")
+                
+                print(f"[GPT Service] ========== PARSED JSON FIELDS ==========")
+                print(f"[GPT Service] Description: {description[:100]}..." if len(description) > 100 else f"[GPT Service] Description: {description}")
+                print(f"[GPT Service] Meta tags: {meta_tags}")
+                print(f"[GPT Service] Meta tags count: {len(meta_tags)}")
+                print(f"[GPT Service] Timestamp: {timestamp_seconds}")
+                print(f"[GPT Service] JSON keys: {list(json_response.keys())}")
+                print(f"[GPT Service] ========================================")
+                
+                logger.info("Successfully parsed JSON response from GPT",
+                           has_description=bool(description),
+                           description_length=len(description) if description else 0,
+                           meta_tags_count=len(meta_tags) if meta_tags else 0,
+                           timestamp=timestamp_seconds,
+                           json_keys=list(json_response.keys()))
+                        
+            except json.JSONDecodeError as e:
+                # JSON parsing failed - log detailed error
+                error_msg = str(e)
+                error_pos = getattr(e, 'pos', 'unknown')
+                logger.error("Failed to parse JSON response from GPT",
+                            error=error_msg,
+                            error_position=error_pos,
+                            content_preview=content[:500] if content else "None",
+                            content_length=len(content) if content else 0,
+                            timestamp=timestamp_seconds)
+                logger.error("Full raw response content", content=content)
+                
+                # Try one final repair attempt
+                try:
+                    repaired = self._repair_json(content)
+                    logger.warning("Attempting final JSON repair", repaired_preview=repaired[:200])
+                    json_response = json.loads(repaired)
+                    
+                    if isinstance(json_response, dict):
+                        description = json_response.get("description", "Error: Could not parse GPT response")
+                        meta_tags = json_response.get("meta_tags", [])
+                        if not isinstance(meta_tags, list):
+                            meta_tags = []
+                        logger.info("JSON repair succeeded after initial failure")
+                    else:
+                        raise ValueError("Repaired JSON is not a dictionary")
+                except Exception as repair_error:
+                    logger.error("JSON repair attempt also failed", repair_error=str(repair_error))
+                    # Re-raise with clear error message
+                    raise ValueError(f"Failed to parse GPT JSON response: {error_msg}. Content preview: {content[:200]}")
+                    
+            except Exception as e:
+                # Unexpected error during JSON parsing
+                logger.error("Unexpected error parsing JSON response",
+                            error=str(e),
+                            error_type=type(e).__name__,
+                            content_preview=content[:500] if content else "None",
+                            timestamp=timestamp_seconds,
+                            exc_info=True)
+                raise
             
             processing_time = int((time.time() - start_time) * 1000)
             
             result = {
                 "description": description,
                 "ocr_text": ocr_text,
+                "meta_tags": meta_tags,  # Add meta_tags to result
                 "processing_time_ms": processing_time,
                 "model": "gpt-4o-mini",
                 "timestamp": timestamp_seconds,
                 "frame_number": frame_number
             }
+            
+            # Store full response in gpt_response for metadata
+            if meta_tags:
+                result["gpt_response"] = {
+                    "description": description,
+                    "ocr_text": ocr_text,
+                    "meta_tags": meta_tags,
+                    "timestamp": timestamp_seconds,
+                    "frame_number": frame_number
+                }
             
             logger.info("Frame analyzed with GPT", 
                        image_path=image_path,
@@ -125,16 +390,28 @@ Frame timestamp: {:.2f} seconds""".format(timestamp_seconds)
             return result
             
         except Exception as e:
+            error_str = str(e)
+            # Clean up error message - remove confusing JSON decode details
+            if "JSON parsing failed" in error_str or "Expecting" in error_str:
+                # Extract a cleaner error message
+                if "Response preview:" in error_str:
+                    # Use the response preview part
+                    error_str = "Invalid JSON response from GPT API"
+                else:
+                    error_str = "Failed to parse GPT response as JSON"
+            
             logger.error("GPT frame analysis failed",
                         image_path=image_path,
-                        error=str(e),
+                        error=error_str,
+                        error_type=type(e).__name__,
                         exc_info=True)
-            # Return error result
+            # Return error result with cleaner message
             return {
-                "description": f"Error analyzing frame: {str(e)}",
+                "description": f"Error analyzing frame: {error_str}",
                 "ocr_text": None,
+                "meta_tags": None,
                 "processing_time_ms": int((time.time() - start_time) * 1000),
-                "error": str(e)
+                "error": error_str
             }
     
     async def batch_analyze_frames(

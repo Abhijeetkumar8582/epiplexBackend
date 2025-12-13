@@ -81,3 +81,9 @@ class VideoUploadUpdate(BaseModel):
     tags: Optional[List[str]] = Field(None, description="Update tags as array")
     language_code: Optional[str] = Field(None, max_length=10, description="Update language code")
     priority: Optional[str] = Field(None, pattern="^(normal|high)$", description="Update priority")
+
+
+class BulkDeleteRequest(BaseModel):
+    """Schema for bulk delete request"""
+    upload_ids: List[str] = Field(..., min_items=1, description="List of upload IDs to delete")
+    permanent: bool = Field(default=False, description="Permanently delete (hard delete)")
