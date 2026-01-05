@@ -329,7 +329,14 @@ class VideoUploadService:
         await db.commit()
         await db.refresh(upload)
         
-        logger.info("Video upload updated", upload_id=str(upload_id), updates=updates)
+        # Log with more detail if status is failed
+        if updates.get("status") == "failed":
+            logger.warning("Video upload updated to failed status", 
+                          upload_id=str(upload_id), 
+                          updates=updates,
+                          error=updates.get("error"))
+        else:
+            logger.info("Video upload updated", upload_id=str(upload_id), updates=updates)
         return upload
     
     @staticmethod
@@ -337,12 +344,15 @@ class VideoUploadService:
         db: AsyncSession,
         upload_id: UUID,
         status: str,
-        job_id: Optional[str] = None
+        job_id: Optional[str] = None,
+        error: Optional[str] = None
     ) -> Optional[VideoUpload]:
         """Update upload status"""
         updates = {"status": status}
         if job_id:
             updates["job_id"] = job_id
+        if error:
+            updates["error"] = error
         
         return await VideoUploadService.update_upload(db, upload_id, updates)
     

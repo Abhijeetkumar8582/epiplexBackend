@@ -9,7 +9,7 @@ from pathlib import Path
 # Check for .env file
 env_file = Path(".env")
 if not env_file.exists():
-    print("⚠️  Warning: .env file not found!")
+    print("[WARNING] .env file not found!")
     print("Please create a .env file with your OPENAI_API_KEY")
     print()
     print("Quick setup:")
@@ -24,25 +24,25 @@ if not env_file.exists():
     
     # Check if OPENAI_API_KEY is set in environment
     if not os.getenv("OPENAI_API_KEY"):
-        print("❌ OPENAI_API_KEY not found in environment variables either.")
+        print("[ERROR] OPENAI_API_KEY not found in environment variables either.")
         print("Please set it before starting the server.")
         sys.exit(1)
     else:
-        print("✓ Using OPENAI_API_KEY from environment variables")
+        print("[OK] Using OPENAI_API_KEY from environment variables")
 
 # Check for required directories
 upload_dir = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 output_dir = Path(os.getenv("OUTPUT_DIR", "./outputs"))
 upload_dir.mkdir(exist_ok=True)
 output_dir.mkdir(exist_ok=True)
-print(f"✓ Upload directory: {upload_dir.absolute()}")
-print(f"✓ Output directory: {output_dir.absolute()}")
+print(f"[OK] Upload directory: {upload_dir.absolute()}")
+print(f"[OK] Output directory: {output_dir.absolute()}")
 
 # Start the server
 if __name__ == "__main__":
     import uvicorn
-    print("\n🚀 Starting FastAPI server...")
-    print("📡 API will be available at http://localhost:8000")
-    print("📚 API docs at http://localhost:8000/docs\n")
+    print("\n[STARTING] FastAPI server...")
+    print("[INFO] API will be available at http://localhost:8000")
+    print("[INFO] API docs at http://localhost:8000/docs\n")
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
 

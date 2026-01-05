@@ -1,6 +1,6 @@
 import cv2
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import os
 
 from app.utils.logger import logger
@@ -10,7 +10,7 @@ class VideoMetadataService:
     """Service to extract video metadata using OpenCV"""
     
     @staticmethod
-    def extract_metadata(video_path: str) -> Dict[str, Optional]:
+    def extract_metadata(video_path: str) -> Dict[str, Any]:
         """
         Extract video metadata from video file
         

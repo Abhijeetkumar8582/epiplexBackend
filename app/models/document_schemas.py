@@ -11,6 +11,7 @@ class FrameData(BaseModel):
     timestamp: float = Field(..., description="Frame timestamp in seconds")
     frame_number: Optional[int] = Field(None, description="Frame number in video")
     image_path: str = Field(..., description="Path to frame image")
+    base64_image: Optional[str] = Field(None, description="Base64 encoded frame image")
     description: Optional[str] = Field(None, description="GPT-generated description")
     ocr_text: Optional[str] = Field(None, description="Extracted OCR text")
     gpt_response: Optional[Dict[str, Any]] = Field(None, description="Full GPT response JSON")

@@ -1,7 +1,7 @@
 """High-performance frame analysis service with queues and threading"""
 import asyncio
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -28,7 +28,7 @@ class FrameAnalysisService:
         video_id: UUID,
         video_path: str,
         frames_dir: Path,
-        frames_per_second: int = 1
+        frames_per_second: float = 0.5
     ) -> List[FrameAnalysis]:
         """
         High-performance frame processing pipeline:
@@ -66,15 +66,18 @@ class FrameAnalysisService:
                        video_id=str(video_id), 
                        frame_count=len(frames))
             
-            # Step 2: Analyze frames in parallel (async)
+            # Step 2: Analyze frames in parallel (async) with batching
+            from app.config import settings
             logger.info("Starting frame analysis with GPT", 
                        video_id=str(video_id),
-                       frame_count=len(frames))
+                       frame_count=len(frames),
+                       batch_size=getattr(settings, 'GPT_BATCH_SIZE', 10))
             
             # Use async batch analysis with GPT service
             analyzed_frames = await self.gpt_service.batch_analyze_frames(
                 frames=frames,
-                max_workers=4
+                max_workers=4,
+                batch_size=getattr(settings, 'GPT_BATCH_SIZE', 10)
             )
             
             logger.info("Frame analysis completed",

@@ -247,6 +247,8 @@ class FrameAnalysis(Base):
     frame_number = Column(Integer, nullable=True)
     # image_path: Path to saved frame image
     image_path = Column(Text, nullable=False)
+    # base64_image: Base64 encoded image for direct display
+    base64_image = Column(Text, nullable=True)
     
     # Analysis results
     # description: GPT-generated description/caption

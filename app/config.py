@@ -40,8 +40,9 @@ class Settings(BaseSettings):
     ALLOWED_EXTENSIONS: Union[str, List[str]] = [".mp4", ".avi", ".mov", ".mkv", ".webm"]
     
     # Frame Analysis Settings
-    FRAMES_PER_SECOND: int = 1  # Extract 1 frame per second
+    FRAMES_PER_SECOND: float = 0.5  # Extract 1 frame every 2 seconds (0.5 frames per second)
     FRAME_ANALYSIS_WORKERS: int = 4  # Number of parallel workers for frame analysis
+    GPT_BATCH_SIZE: int = 10  # Number of frames to send in a single GPT API call
     
     # Database Settings
     # SQL Server format: mssql+aioodbc://user:password@host:port/database?driver=ODBC+Driver+17+for+SQL+Server
@@ -166,12 +167,12 @@ settings = Settings()
 # Validate and log API key status on import
 if settings.OPENAI_API_KEY:
     masked_key = f"{settings.OPENAI_API_KEY[:7]}...{settings.OPENAI_API_KEY[-4:]}" if len(settings.OPENAI_API_KEY) > 11 else "***"
-    print(f"✓ OpenAI API key loaded: {masked_key}")
+    print(f"[OK] OpenAI API key loaded: {masked_key}")
     # Verify it's not a placeholder
     if 'your_openai_api_key_here' in settings.OPENAI_API_KEY.lower() or 'your_ope' in settings.OPENAI_API_KEY.lower():
-        print("⚠️  Warning: OPENAI_API_KEY appears to be a placeholder value!")
+        print("[WARNING] OPENAI_API_KEY appears to be a placeholder value!")
         print("   Please update your .env file with a valid API key")
         settings.OPENAI_API_KEY = None
 else:
-    print("⚠️  Warning: OPENAI_API_KEY not found in .env file or environment variables")
+    print("[WARNING] OPENAI_API_KEY not found in .env file or environment variables")
     print("   Please set OPENAI_API_KEY in your .env file or as an environment variable")

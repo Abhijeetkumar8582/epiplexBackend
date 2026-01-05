@@ -4,6 +4,7 @@ Handles complete pipeline: upload -> audio extraction -> transcription -> keyfra
 """
 import asyncio
 import aiofiles
+import base64
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from uuid import UUID
@@ -27,7 +28,8 @@ class VideoProcessingService:
         self.frame_extractor = FrameExtractionService()
         self.gpt_service = GPTService()
         self.audio_extractor = AudioExtractionService()
-        self.batch_size = 5  # Process 5 frames at a time
+        # Use GPT_BATCH_SIZE from config (default: 10 frames per batch)
+        self.batch_size = getattr(settings, 'GPT_BATCH_SIZE', 10)
     
     async def extract_audio(
         self,
@@ -283,7 +285,7 @@ class VideoProcessingService:
         db: AsyncSession
     ) -> List[Dict[str, Any]]:
         """
-        Step 3: Extract keyframes (1 per second) from video
+        Step 3: Extract keyframes (1 every 2 seconds) from video
         
         Args:
             video_path: Path to video file
@@ -299,7 +301,7 @@ class VideoProcessingService:
             # Update job status
             await JobService.update_job(db, job_id, {
                 "progress": 35,
-                "message": "Extracting keyframes from video (1 per second)...",
+                "message": "Extracting keyframes from video (1 every 2 seconds)...",
                 "current_step": "extract_frames",
                 "step_progress": {
                     "upload": "completed",
@@ -317,12 +319,12 @@ class VideoProcessingService:
                        job_id=job_id, 
                        video_id=str(video_id))
             
-            # Extract frames (1 per second)
+            # Extract frames (1 every 2 seconds)
             frames = await self.frame_extractor.extract_frames_async(
                 video_path=video_path,
                 output_dir=frames_dir,
                 video_id=str(video_id),
-                frames_per_second=1  # 1 frame per second
+                frames_per_second=settings.FRAMES_PER_SECOND  # Use config value (default: 0.5 = 1 frame every 2 seconds)
             )
             
             if not frames:
@@ -396,7 +398,7 @@ class VideoProcessingService:
                        total_frames=total_frames,
                        batch_size=self.batch_size)
             
-            # Process frames in batches of 5
+            # Process frames in batches (using GPT_BATCH_SIZE from config, default: 10)
             for batch_start in range(0, total_frames, self.batch_size):
                 batch_end = min(batch_start + self.batch_size, total_frames)
                 batch = frames[batch_start:batch_end]
@@ -408,7 +410,12 @@ class VideoProcessingService:
                            batch_start=batch_start, 
                            batch_end=batch_end)
                 
-                # Update progress
+                # Update progress - ensure all previous steps are marked as completed
+                # For SQL Server, flush any pending operations before updating job status
+                from app.database import _is_sql_server
+                if _is_sql_server:
+                    await db.flush()  # Flush any pending frame operations
+                
                 progress = 50 + int((batch_start / total_frames) * 40)  # 50-90%
                 await JobService.update_job(db, job_id, {
                     "progress": progress,
@@ -420,59 +427,165 @@ class VideoProcessingService:
                         "transcribe": "completed",
                         "extract_frames": "completed",
                         "analyze_frames": "processing",
+                        "summary_generation": "pending",
+                        "generate_pdf": "pending",
                         "complete": "pending"
                     }
                 })
                 
-                # Analyze batch with GPT
-                analyzed_batch = await self.gpt_service.batch_analyze_frames(
-                    frames=batch,
-                    max_workers=min(self.batch_size, 5)  # Process up to 5 concurrently
-                )
-                
-                # Store batch in database
-                batch_frame_analyses = []
-                for frame_data in analyzed_batch:
-                    # Create GPT response object
-                    gpt_response = {
-                        "description": frame_data.get("description"),
-                        "ocr_text": frame_data.get("ocr_text"),
-                        "meta_tags": frame_data.get("meta_tags"),  # Include meta_tags
-                        "processing_time_ms": frame_data.get("processing_time_ms"),
-                        "timestamp": frame_data.get("timestamp"),
-                        "frame_number": frame_data.get("frame_number"),
-                        "image_path": frame_data.get("image_path"),
-                        "model": "gpt-4o-mini"
-                    }
+                # Analyze batch with GPT (using config batch size)
+                from app.config import settings
+                try:
+                    logger.info(f"Calling batch_analyze_frames for batch {batch_num}",
+                               batch_size=len(batch),
+                               gpt_batch_size=getattr(settings, 'GPT_BATCH_SIZE', 10))
                     
-                    # Create FrameAnalysis object
-                    frame_analysis = FrameAnalysis(
-                        video_id=video_id,
-                        timestamp=frame_data.get("timestamp", 0.0),
-                        frame_number=frame_data.get("frame_number"),
-                        image_path=frame_data.get("image_path"),
-                        description=frame_data.get("description"),
-                        ocr_text=frame_data.get("ocr_text"),
-                        gpt_response=gpt_response,
-                        processing_time_ms=frame_data.get("processing_time_ms")
+                    analyzed_batch = await self.gpt_service.batch_analyze_frames(
+                        frames=batch,
+                        max_workers=min(self.batch_size, 5),  # Process up to 5 concurrently
+                        batch_size=getattr(settings, 'GPT_BATCH_SIZE', 10)  # Use config batch size
                     )
                     
-                    batch_frame_analyses.append(frame_analysis)
-                    db.add(frame_analysis)
+                    logger.info(f"batch_analyze_frames completed for batch {batch_num}",
+                               analyzed_count=len(analyzed_batch))
+                except Exception as gpt_error:
+                    logger.error(f"GPT batch analysis failed for batch {batch_num}",
+                               error=str(gpt_error),
+                               error_type=type(gpt_error).__name__,
+                               exc_info=True)
+                    # Continue with next batch instead of failing completely
+                    # Create placeholder frames with error
+                    analyzed_batch = []
+                    for frame in batch:
+                        analyzed_batch.append({
+                            **frame,
+                            "description": f"Error in batch analysis: {str(gpt_error)}",
+                            "ocr_text": None,
+                            "meta_tags": [],
+                            "processing_time_ms": 0,
+                            "error": str(gpt_error)
+                        })
                 
-                # Commit batch to database
-                await db.commit()
+                # Store batch in database
+                if not analyzed_batch:
+                    logger.warning(f"No analyzed frames returned for batch {batch_num}",
+                                 job_id=job_id,
+                                 batch_size=len(batch))
+                    # Skip this batch but continue
+                    continue
                 
-                # Refresh all objects
-                for fa in batch_frame_analyses:
-                    await db.refresh(fa)
-                
-                processed_frames.extend(batch_frame_analyses)
-                
-                logger.info(f"Batch {batch_num} completed and stored", 
-                           job_id=job_id, 
-                           frames_in_batch=len(batch_frame_analyses),
-                           total_processed=len(processed_frames))
+                batch_frame_analyses = []
+                try:
+                    from app.database import _is_sql_server
+                    
+                    # For SQL Server, commit frames one at a time to avoid UUID sentinel value mismatch
+                    if _is_sql_server:
+                        for frame_data in analyzed_batch:
+                            # Read and encode image as base64
+                            base64_image = None
+                            image_path = frame_data.get("image_path")
+                            if image_path and Path(image_path).exists():
+                                try:
+                                    async with aiofiles.open(image_path, 'rb') as img_file:
+                                        image_bytes = await img_file.read()
+                                        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                                except Exception as e:
+                                    logger.warning(f"Failed to encode image as base64: {image_path}", error=str(e))
+                            
+                            # Create GPT response object
+                            gpt_response = {
+                                "description": frame_data.get("description", ""),
+                                "ocr_text": frame_data.get("ocr_text"),
+                                "meta_tags": frame_data.get("meta_tags", []),
+                                "processing_time_ms": frame_data.get("processing_time_ms", 0),
+                                "timestamp": frame_data.get("timestamp", 0.0),
+                                "frame_number": frame_data.get("frame_number"),
+                                "image_path": frame_data.get("image_path"),
+                                "model": "gpt-4o-mini"
+                            }
+                            
+                            # Create FrameAnalysis object
+                            frame_analysis = FrameAnalysis(
+                                video_id=video_id,
+                                timestamp=frame_data.get("timestamp", 0.0),
+                                frame_number=frame_data.get("frame_number"),
+                                image_path=frame_data.get("image_path"),
+                                base64_image=base64_image,
+                                description=frame_data.get("description", ""),
+                                ocr_text=frame_data.get("ocr_text"),
+                                gpt_response=gpt_response,
+                                processing_time_ms=frame_data.get("processing_time_ms", 0)
+                            )
+                            
+                            db.add(frame_analysis)
+                            await db.flush()  # Flush to get the ID without committing
+                            batch_frame_analyses.append(frame_analysis)
+                        
+                        # Commit all at once after flushing
+                        await db.commit()
+                    else:
+                        # For other databases, add all and commit together
+                        for frame_data in analyzed_batch:
+                            # Read and encode image as base64
+                            base64_image = None
+                            image_path = frame_data.get("image_path")
+                            if image_path and Path(image_path).exists():
+                                try:
+                                    async with aiofiles.open(image_path, 'rb') as img_file:
+                                        image_bytes = await img_file.read()
+                                        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                                except Exception as e:
+                                    logger.warning(f"Failed to encode image as base64: {image_path}", error=str(e))
+                            
+                            # Create GPT response object
+                            gpt_response = {
+                                "description": frame_data.get("description", ""),
+                                "ocr_text": frame_data.get("ocr_text"),
+                                "meta_tags": frame_data.get("meta_tags", []),
+                                "processing_time_ms": frame_data.get("processing_time_ms", 0),
+                                "timestamp": frame_data.get("timestamp", 0.0),
+                                "frame_number": frame_data.get("frame_number"),
+                                "image_path": frame_data.get("image_path"),
+                                "model": "gpt-4o-mini"
+                            }
+                            
+                            # Create FrameAnalysis object
+                            frame_analysis = FrameAnalysis(
+                                video_id=video_id,
+                                timestamp=frame_data.get("timestamp", 0.0),
+                                frame_number=frame_data.get("frame_number"),
+                                image_path=frame_data.get("image_path"),
+                                base64_image=base64_image,
+                                description=frame_data.get("description", ""),
+                                ocr_text=frame_data.get("ocr_text"),
+                                gpt_response=gpt_response,
+                                processing_time_ms=frame_data.get("processing_time_ms", 0)
+                            )
+                            
+                            batch_frame_analyses.append(frame_analysis)
+                            db.add(frame_analysis)
+                        
+                        # Commit batch to database
+                        await db.commit()
+                        
+                        # Refresh objects for non-SQL Server databases
+                        for fa in batch_frame_analyses:
+                            await db.refresh(fa)
+                    
+                    processed_frames.extend(batch_frame_analyses)
+                    
+                    logger.info(f"Batch {batch_num} completed and stored", 
+                               job_id=job_id, 
+                               frames_in_batch=len(batch_frame_analyses),
+                               total_processed=len(processed_frames))
+                except Exception as db_error:
+                    logger.error(f"Failed to store batch {batch_num} in database",
+                               job_id=job_id,
+                               error=str(db_error),
+                               exc_info=True)
+                    await db.rollback()
+                    # Continue to next batch instead of failing completely
+                    logger.warning(f"Continuing to next batch after database error in batch {batch_num}")
             
             logger.info("All frames processed and stored", 
                        job_id=job_id, 
@@ -507,8 +620,8 @@ class VideoProcessingService:
         Complete video processing pipeline:
         1. Extract audio from video
         2. Transcribe audio using OpenAI Whisper
-        3. Extract keyframes (1 per second)
-        4. Process frames in batches of 5 through GPT 4o Mini
+        3. Extract keyframes (1 every 2 seconds)
+        4. Process frames in batches of 10 through GPT 4o Mini
         5. Store everything in database
         
         Args:

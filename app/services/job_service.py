@@ -32,19 +32,65 @@ class JobService:
         job_id: str,
         updates: Dict[str, Any]
     ) -> Optional[JobStatus]:
-        """Update job status"""
-        updates["updated_at"] = datetime.utcnow()
-        await db.execute(
-            update(JobStatus)
-            .where(JobStatus.job_id == job_id)
-            .values(**updates)
-        )
-        await db.commit()
+        """Update job status - merges step_progress instead of replacing it"""
+        from app.database import _is_sql_server
         
-        job = await JobService.get_job(db, job_id)
-        if job:
+        # For SQL Server, we need to handle connection busy issues
+        # Get current job to merge step_progress
+        current_job = None
+        try:
+            current_job = await JobService.get_job(db, job_id)
+            # For SQL Server, ensure result is fully consumed by accessing the data
+            if current_job and _is_sql_server:
+                # Access all attributes to ensure result is consumed
+                _ = current_job.job_id
+                _ = current_job.step_progress
+        except Exception as e:
+            logger.warning(f"Failed to get current job for merging, continuing without merge: {str(e)}")
+        
+        if current_job and "step_progress" in updates:
+            # Merge step_progress instead of replacing
+            current_step_progress = current_job.step_progress or {}
+            new_step_progress = updates.get("step_progress", {})
+            # Merge: new values override old ones, but keep existing steps
+            merged_step_progress = {**current_step_progress, **new_step_progress}
+            updates["step_progress"] = merged_step_progress
+        
+        updates["updated_at"] = datetime.utcnow()
+        
+        # For SQL Server, ensure any pending operations are flushed first
+        # to avoid "connection is busy" errors
+        try:
+            if _is_sql_server:
+                # Flush any pending operations before starting new query
+                await db.flush()
+            
+            await db.execute(
+                update(JobStatus)
+                .where(JobStatus.job_id == job_id)
+                .values(**updates)
+            )
+            
+            if _is_sql_server:
+                # For SQL Server, flush before commit to avoid connection busy errors
+                await db.flush()
+            
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Failed to update job status: {str(e)}", job_id=job_id, exc_info=True)
+            raise
+        
+        # Don't fetch again for SQL Server to avoid connection busy errors
+        # Just return None or log the update
+        if _is_sql_server:
             logger.info("Job updated", job_id=job_id, updates=updates)
-        return job
+            return None
+        else:
+            job = await JobService.get_job(db, job_id)
+            if job:
+                logger.info("Job updated", job_id=job_id, updates=updates)
+            return job
     
     @staticmethod
     async def get_job_dict(db: AsyncSession, job_id: str) -> Optional[Dict[str, Any]]:

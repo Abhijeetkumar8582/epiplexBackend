@@ -22,7 +22,7 @@ class FrameExtractionService:
         video_path: str,
         output_dir: Path,
         video_id: str,
-        frames_per_second: int = 1
+        frames_per_second: float = 0.5
     ) -> List[Dict]:
         """
         Extract frames from video using OpenCV
@@ -32,7 +32,7 @@ class FrameExtractionService:
             video_path: Path to video file
             output_dir: Directory to save frames
             video_id: Unique video identifier
-            frames_per_second: Number of frames to extract per second (default: 1)
+            frames_per_second: Number of frames to extract per second (default: 0.5 = 1 frame every 2 seconds)
         
         Returns:
             List of frame dictionaries with timestamp, frame data, and path
@@ -47,7 +47,7 @@ class FrameExtractionService:
         if fps == 0:
             raise Exception("Invalid video FPS")
         
-        frame_interval = int(fps / frames_per_second)  # Frames to skip
+        frame_interval = int(fps / frames_per_second) if frames_per_second > 0 else 1  # Frames to skip
         frame_count = 0
         timestamp = 0.0
         
@@ -102,7 +102,7 @@ class FrameExtractionService:
         video_path: str,
         output_dir: Path,
         video_id: str,
-        frames_per_second: int = 1
+        frames_per_second: float = 0.5
     ) -> List[Dict]:
         """Async wrapper for frame extraction"""
         loop = asyncio.get_event_loop()

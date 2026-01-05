@@ -1461,6 +1461,7 @@ async def get_document_by_file_number(
                 timestamp=fa.timestamp,
                 frame_number=fa.frame_number,
                 image_path=fa.image_path,
+                base64_image=fa.base64_image,
                 description=fa.description,
                 ocr_text=fa.ocr_text,
                 gpt_response=fa.gpt_response,
@@ -1753,7 +1754,7 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
     """
     Production-ready background task to process video:
     1. Extract audio and transcribe using OpenAI Whisper
-    2. Extract keyframes (1 per second)
+    2. Extract keyframes (1 every 2 seconds)
     3. Process frames in batches of 5 through ChatGPT 4o Mini
     4. Store everything in database
     """
@@ -1786,10 +1787,12 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
                 "current_step": "extract_audio",
                 "step_progress": {
                     "upload": "completed",
-                    "extract_audio": "pending",
+                    "extract_audio": "processing",
                     "transcribe": "pending",
                     "extract_frames": "pending",
                     "analyze_frames": "pending",
+                    "summary_generation": "pending",
+                    "generate_pdf": "pending",
                     "complete": "pending"
                 }
             })
@@ -1861,7 +1864,12 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
             if upload_id:
                 try:
                     from uuid import UUID
-                    await VideoUploadService.update_upload_status(db, UUID(upload_id), "failed")
+                    await VideoUploadService.update_upload_status(
+                        db, 
+                        UUID(upload_id), 
+                        "failed",
+                        error=str(e)
+                    )
                 except Exception as upload_error:
                     logger.error("Failed to update video upload status", 
                                upload_id=upload_id, 

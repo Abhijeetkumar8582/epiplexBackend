@@ -414,17 +414,225 @@ Frame timestamp: {timestamp} seconds"""
                 "error": error_str
             }
     
+    async def analyze_frame_batch(
+        self,
+        frames_batch: List[Dict]
+    ) -> List[Dict]:
+        """
+        Analyze a batch of frames in a single GPT API call (up to 10 frames)
+        
+        Args:
+            frames_batch: List of frame dictionaries (max 10 frames)
+        
+        Returns:
+            List of analyzed frames with GPT responses
+        """
+        if not self.client:
+            raise ValueError("OpenAI API key not configured")
+        
+        if not frames_batch:
+            return []
+        
+        start_time = time.time()
+        
+        try:
+            # Prepare images for batch processing
+            image_contents = []
+            for frame in frames_batch:
+                image_path = frame.get("image_path") or frame.get("frame_path")
+                if not image_path:
+                    continue
+                
+                async with aiofiles.open(image_path, 'rb') as f:
+                    image_data = await f.read()
+                    base64_image = base64.b64encode(image_data).decode('utf-8')
+                    image_contents.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    })
+            
+            if not image_contents:
+                logger.warning("No valid images in batch")
+                return frames_batch
+            
+            # Create prompt that asks for analysis of all frames
+            timestamps = [f.get("timestamp", 0.0) for f in frames_batch]
+            prompt_text = f"""Analyze these {len(frames_batch)} video frames and provide a JSON response for EACH frame.
+
+For each frame, provide:
+1. A detailed description of what you see (UI elements, text, layout, etc.)
+2. Extract any visible text (OCR) from the frame
+3. Three meta tags that describe the frame content
+
+IMPORTANT: Return a JSON object with a "frames" key containing an array. Each element in the array corresponds to a frame in order:
+{{
+  "frames": [
+    {{
+      "timestamp": <timestamp_in_seconds>,
+      "description": "<detailed_description>",
+      "ocr_text": "<extracted_text_or_null>",
+      "meta_tags": ["tag1", "tag2", "tag3"]
+    }},
+    ...
+  ]
+}}
+
+Frame timestamps (in order): {', '.join([str(ts) for ts in timestamps])}"""
+            
+            # Call GPT-4 Vision API with multiple images
+            api_params = {
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt_text
+                            }
+                        ] + image_contents
+                    }
+                ],
+                "max_tokens": 4000,  # Increased for batch processing
+                "response_format": {"type": "json_object"}
+            }
+            
+            logger.info("Making batch GPT API call", 
+                       frame_count=len(frames_batch),
+                       image_count=len(image_contents))
+            
+            # Add timeout to prevent hanging
+            import asyncio
+            try:
+                response = await asyncio.wait_for(
+                    self.client.chat.completions.create(**api_params),
+                    timeout=300.0  # 5 minute timeout per batch
+                )
+            except asyncio.TimeoutError:
+                logger.error("GPT API call timed out after 5 minutes",
+                           batch_size=len(frames_batch))
+                raise Exception("GPT API call timed out after 5 minutes. Batch may be too large or API is slow.")
+            
+            # Parse response
+            content = response.choices[0].message.content
+            processing_time = int((time.time() - start_time) * 1000)
+            
+            # Parse JSON response
+            try:
+                content_cleaned = content.strip() if content else ""
+                json_response = json.loads(content_cleaned)
+                
+                logger.info("Parsed JSON response", 
+                           response_type=type(json_response).__name__,
+                           has_frames_key="frames" in json_response if isinstance(json_response, dict) else False,
+                           keys=list(json_response.keys()) if isinstance(json_response, dict) else None)
+                
+                # Handle response format - expect object with "frames" array
+                if isinstance(json_response, dict) and "frames" in json_response:
+                    results = json_response["frames"]
+                    if not isinstance(results, list):
+                        logger.warning("Frames key exists but is not a list", frames_type=type(results).__name__)
+                        results = [results] if results else []
+                elif isinstance(json_response, list):
+                    # Fallback: if we get an array directly, use it
+                    logger.warning("Received array instead of object with frames key")
+                    results = json_response
+                elif isinstance(json_response, dict):
+                    # Try to find frame data in other keys
+                    logger.warning("No 'frames' key found, checking for alternative structure", keys=list(json_response.keys()))
+                    # Check if it's a single frame response
+                    if "timestamp" in json_response or "description" in json_response:
+                        results = [json_response]
+                    else:
+                        # Try to extract any array from the response
+                        for key, value in json_response.items():
+                            if isinstance(value, list):
+                                results = value
+                                logger.info("Found array in key", key=key, array_length=len(value))
+                                break
+                        else:
+                            raise ValueError(f"Could not find frames array in response. Keys: {list(json_response.keys())}")
+                else:
+                    raise ValueError(f"Unexpected response format: {type(json_response)}")
+                
+                logger.info("Extracted results", results_count=len(results), expected_count=len(frames_batch))
+                
+                # Map results back to frames
+                analyzed_frames = []
+                for i, frame in enumerate(frames_batch):
+                    if i < len(results):
+                        result = results[i]
+                        frame.update({
+                            "description": result.get("description", ""),
+                            "ocr_text": result.get("ocr_text"),
+                            "meta_tags": result.get("meta_tags", []),
+                            "processing_time_ms": processing_time // len(frames_batch),  # Divide time per frame
+                            "gpt_response": result
+                        })
+                    else:
+                        # Missing result for this frame
+                        frame.update({
+                            "description": "No analysis result",
+                            "ocr_text": None,
+                            "meta_tags": [],
+                            "processing_time_ms": 0,
+                            "error": "Missing result in batch response"
+                        })
+                    analyzed_frames.append(frame)
+                
+                logger.info("Batch frame analysis completed successfully",
+                           batch_size=len(frames_batch),
+                           processing_time_ms=processing_time,
+                           results_count=len(analyzed_frames))
+                
+                return analyzed_frames
+                
+            except json.JSONDecodeError as e:
+                logger.error("Failed to parse batch JSON response",
+                           error=str(e),
+                           content_preview=content[:500])
+                # Return frames with error
+                for frame in frames_batch:
+                    frame.update({
+                        "description": f"Error parsing batch response: {str(e)}",
+                        "ocr_text": None,
+                        "meta_tags": [],
+                        "processing_time_ms": processing_time // len(frames_batch),
+                        "error": str(e)
+                    })
+                return frames_batch
+                
+        except Exception as e:
+            logger.error("Batch frame analysis failed",
+                        error=str(e),
+                        batch_size=len(frames_batch),
+                        exc_info=True)
+            # Return frames with error
+            for frame in frames_batch:
+                frame.update({
+                    "description": f"Error in batch analysis: {str(e)}",
+                    "ocr_text": None,
+                    "meta_tags": [],
+                    "processing_time_ms": 0,
+                    "error": str(e)
+                })
+            return frames_batch
+    
     async def batch_analyze_frames(
         self,
         frames: List[Dict],
-        max_workers: int = 5
+        max_workers: int = 5,
+        batch_size: int = 10
     ) -> List[Dict]:
         """
-        Analyze multiple frames in parallel (production-ready with error handling)
+        Analyze multiple frames in batches (production-ready with error handling)
         
         Args:
             frames: List of frame dictionaries with 'image_path', 'timestamp', etc.
-            max_workers: Maximum number of concurrent API calls (default: 5 for batch processing)
+            max_workers: Maximum number of concurrent batch API calls (default: 5)
+            batch_size: Number of frames to send in each batch (default: 10)
         
         Returns:
             List of analyzed frames with GPT responses
@@ -438,6 +646,7 @@ Frame timestamp: {timestamp} seconds"""
                 frame.update({
                     "description": "OpenAI API key not configured",
                     "ocr_text": None,
+                    "meta_tags": [],
                     "processing_time_ms": 0,
                     "error": "OpenAI API key not configured"
                 })
@@ -446,56 +655,69 @@ Frame timestamp: {timestamp} seconds"""
         if not frames:
             return []
         
-        # Create semaphore to limit concurrent API calls
+        # Split frames into batches
+        frame_batches = []
+        for i in range(0, len(frames), batch_size):
+            batch = frames[i:i + batch_size]
+            frame_batches.append(batch)
+        
+        logger.info("Processing frames in batches",
+                   total_frames=len(frames),
+                   batch_size=batch_size,
+                   total_batches=len(frame_batches))
+        
+        # Create semaphore to limit concurrent batch API calls
         semaphore = asyncio.Semaphore(max_workers)
         
-        async def analyze_with_semaphore(frame_data):
+        async def analyze_batch_with_semaphore(batch):
             async with semaphore:
                 try:
-                    return await self.analyze_frame(
-                        image_path=frame_data.get("image_path") or frame_data.get("frame_path"),
-                        timestamp_seconds=frame_data.get("timestamp", 0.0),
-                        frame_number=frame_data.get("frame_number")
-                    )
+                    return await self.analyze_frame_batch(batch)
                 except Exception as e:
-                    logger.error("Frame analysis exception",
-                               frame_index=frame_data.get("frame_number"),
+                    logger.error("Batch analysis exception",
+                               batch_size=len(batch),
                                error=str(e))
-                    return {
-                        "description": f"Error analyzing frame: {str(e)}",
-                        "ocr_text": None,
-                        "processing_time_ms": 0,
-                        "error": str(e)
-                    }
+                    # Return frames with error
+                    for frame in batch:
+                        frame.update({
+                            "description": f"Error analyzing batch: {str(e)}",
+                            "ocr_text": None,
+                            "meta_tags": [],
+                            "processing_time_ms": 0,
+                            "error": str(e)
+                        })
+                    return batch
         
-        # Analyze all frames concurrently
-        tasks = [analyze_with_semaphore(frame) for frame in frames]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Process all batches concurrently
+        tasks = [analyze_batch_with_semaphore(batch) for batch in frame_batches]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Merge results with frame data
+        # Flatten results
         analyzed_frames = []
-        for i, (frame, result) in enumerate(zip(frames, results)):
-            if isinstance(result, Exception):
-                logger.error("Frame analysis failed",
-                           frame_index=i,
-                           timestamp=frame.get("timestamp"),
-                           error=str(result))
-                frame.update({
-                    "description": f"Error: {str(result)}",
-                    "ocr_text": None,
-                    "processing_time_ms": 0,
-                    "error": str(result)
-                })
+        for batch_result in batch_results:
+            if isinstance(batch_result, Exception):
+                logger.error("Batch processing failed", error=str(batch_result))
+                # Create error frames for this batch
+                for frame in frames[len(analyzed_frames):len(analyzed_frames) + batch_size]:
+                    frame.update({
+                        "description": f"Error: {str(batch_result)}",
+                        "ocr_text": None,
+                        "meta_tags": [],
+                        "processing_time_ms": 0,
+                        "error": str(batch_result)
+                    })
+                    analyzed_frames.append(frame)
             else:
-                frame.update(result)
-            analyzed_frames.append(frame)
+                analyzed_frames.extend(batch_result)
         
         # Sort by timestamp to maintain order
         analyzed_frames.sort(key=lambda x: x.get("timestamp", 0))
         
+        successful = sum(1 for f in analyzed_frames if "error" not in f or not f.get("error"))
         logger.info("Batch frame analysis completed",
                    total_frames=len(analyzed_frames),
-                   successful=sum(1 for f in analyzed_frames if "error" not in f or not f.get("error")))
+                   successful=successful,
+                   batches_processed=len(frame_batches))
         
         return analyzed_frames
 
