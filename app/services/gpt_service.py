@@ -28,7 +28,10 @@ class GPTService:
     def _load_prompt_template(self) -> str:
         """Load prompt template from prompt.txt file"""
         try:
-            prompt_file = Path(__file__).parent.parent.parent / "prompt.txt"
+            # Try app/prompt.txt first (new location), then fallback to backend root
+            prompt_file = Path(__file__).parent.parent / "prompt.txt"
+            if not prompt_file.exists():
+                prompt_file = Path(__file__).parent.parent.parent / "prompt.txt"
             logger.info("Loading prompt template", prompt_file=str(prompt_file))
             if prompt_file.exists():
                 with open(prompt_file, 'r', encoding='utf-8') as f:

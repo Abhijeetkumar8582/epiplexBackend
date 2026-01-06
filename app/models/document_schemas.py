@@ -38,7 +38,6 @@ class VideoMetadata(BaseModel):
     language_code: Optional[str] = None
     priority: Optional[str] = None
     audio_url: Optional[str] = None
-    summary_pdf_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -55,7 +54,6 @@ class DocumentResponse(BaseModel):
     frames: List[FrameData] = Field(..., description="List of all frame analyses")
     summary: Dict[str, Any] = Field(..., description="Summary statistics")
     transcript: Optional[str] = Field(None, description="Transcribed text from video audio")
-    summary_pdf_url: Optional[str] = Field(None, description="URL to generated summary PDF")
     created_at: datetime = Field(..., description="When document was generated")
     
     class Config:

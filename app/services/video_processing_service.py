@@ -5,6 +5,7 @@ Handles complete pipeline: upload -> audio extraction -> transcription -> keyfra
 import asyncio
 import aiofiles
 import base64
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from uuid import UUID
@@ -675,72 +676,53 @@ class VideoProcessingService:
                 db=db
             )
             
-            # Step 5: Generate summaries in batches of 30
-            from app.services.summary_service import SummaryService
-            summary_service = SummaryService()
-            
-            logger.info("Starting summary generation", 
-                       job_id=job_id, 
-                       video_id=str(video_id))
-            
-            # Step 5: Generate summaries
-            await JobService.update_job(db, job_id, {
-                "progress": 85,
-                "message": "Generating summaries from frame analyses...",
-                "current_step": "summary_generation",
-                "step_progress": {
-                    "upload": "completed",
-                    "extract_audio": "completed",
-                    "transcribe": "completed",
-                    "extract_frames": "completed",
-                    "analyze_frames": "completed",
-                    "summary_generation": "processing",
-                    "generate_pdf": "pending",
-                    "complete": "pending"
-                }
-            })
-            
+            # Cleanup: Delete frame files from disk after base64 images are stored in database
             try:
-                summaries = await summary_service.generate_video_summaries(
-                    db=db,
-                    video_id=video_id,
-                    job_id=job_id
-                )
-                
-                logger.info("Summary generation completed",
-                           job_id=job_id,
-                           video_id=str(video_id),
-                           total_summaries=len(summaries))
-            except Exception as summary_error:
-                logger.error("Summary generation failed, continuing with PDF generation",
-                           job_id=job_id,
-                           video_id=str(video_id),
-                           error=str(summary_error))
-                # Don't fail the whole process if summary generation fails
-                summaries = []
+                video_frames_dir = frames_dir / str(video_id)
+                if video_frames_dir.exists():
+                    shutil.rmtree(video_frames_dir)
+                    logger.info("Frame files deleted after processing", 
+                               job_id=job_id,
+                               video_id=str(video_id),
+                               frames_dir=str(video_frames_dir))
+            except Exception as cleanup_error:
+                # Log but don't fail the entire process if cleanup fails
+                logger.warning("Failed to cleanup frame files", 
+                             job_id=job_id,
+                             video_id=str(video_id),
+                             error=str(cleanup_error))
             
-            # Step 6: Generate PDF (PDF is already generated during summary generation, just update status)
-            await JobService.update_job(db, job_id, {
-                "progress": 95,
-                "message": "PDF generation completed...",
-                "current_step": "generate_pdf",
-                "step_progress": {
-                    "upload": "completed",
-                    "extract_audio": "completed",
-                    "transcribe": "completed",
-                    "extract_frames": "completed",
-                    "analyze_frames": "completed",
-                    "summary_generation": "completed",
-                    "generate_pdf": "completed",
-                    "complete": "pending"
-                }
-            })
+            # Cleanup: Delete audio file and directory from disk after transcription is complete and stored in database
+            try:
+                video_audio_dir = audio_dir / str(video_id)
+                if video_audio_dir.exists():
+                    shutil.rmtree(video_audio_dir)
+                    logger.info("Audio file and directory deleted after processing", 
+                               job_id=job_id,
+                               video_id=str(video_id),
+                               audio_dir=str(video_audio_dir))
+                else:
+                    # Fallback: try to delete just the audio file if directory structure is different
+                    audio_file_path = Path(audio_path)
+                    if audio_file_path.exists():
+                        audio_file_path.unlink()
+                        logger.info("Audio file deleted after processing (single file)", 
+                                   job_id=job_id,
+                                   video_id=str(video_id),
+                                   audio_path=str(audio_file_path))
+            except Exception as cleanup_error:
+                # Log but don't fail the entire process if cleanup fails
+                logger.warning("Failed to cleanup audio file", 
+                             job_id=job_id,
+                             video_id=str(video_id),
+                             audio_path=audio_path,
+                             error=str(cleanup_error))
             
-            # Step 7: Mark as completed
+            # Mark as completed
             await JobService.update_job(db, job_id, {
                 "status": "completed",
                 "progress": 100,
-                "message": f"Processing completed successfully. Transcribed {len(transcript)} characters, analyzed {len(frame_analyses)} frames, generated {len(summaries)} summaries and PDF.",
+                "message": f"Processing completed successfully. Transcribed {len(transcript)} characters, analyzed {len(frame_analyses)} frames.",
                 "current_step": "complete",
                 "step_progress": {
                     "upload": "completed",
@@ -748,8 +730,6 @@ class VideoProcessingService:
                     "transcribe": "completed",
                     "extract_frames": "completed",
                     "analyze_frames": "completed",
-                    "summary_generation": "completed",
-                    "generate_pdf": "completed",
                     "complete": "completed"
                 }
             })

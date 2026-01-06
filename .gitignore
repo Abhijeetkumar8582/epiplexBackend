@@ -25,6 +25,16 @@ uploads/
 outputs/
 frames/
 audio/
+
+# Keep directory structure but ignore contents
+uploads/*
+!uploads/.gitkeep
+outputs/*
+!outputs/.gitkeep
+frames/*
+!frames/.gitkeep
+audio/*
+!audio/.gitkeep
 *.mp4
 *.avi
 *.mov

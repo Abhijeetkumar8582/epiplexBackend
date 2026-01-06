@@ -356,7 +356,7 @@ async def init_db():
             logger.info("Tables may already exist with different schema - this is OK")
         else:
             logger.warning(f"Database initialization warning: {error_msg}")
-            logger.warning("If tables don't exist, please run: python backend/run_migration.py")
+            logger.warning("If tables don't exist, please run: python scripts/run_migration.py")
         # Continue anyway - tables might be managed by migration scripts
 
 

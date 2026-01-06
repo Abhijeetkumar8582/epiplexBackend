@@ -29,7 +29,9 @@ from app.services.google_oauth_service import GoogleOAuthService
 from app.services.video_upload_service import VideoUploadService
 from app.services.video_metadata_service import VideoMetadataService
 from app.services.frame_analysis_service import FrameAnalysisService
-from app.services.summary_service import SummaryService
+from app.services.cache_service import CacheService
+from app.services.metrics_service import metrics_service
+from app.services.system_monitor import system_monitor
 from app.models import (
     UserSignup, UserLogin, SignupResponse, LoginResponse, UserResponse,
     VideoUploadCreate, VideoUploadResponse, VideoUploadListResponse, VideoUploadUpdate, BulkDeleteRequest,
@@ -46,6 +48,7 @@ from app.middleware.error_handler import (
     http_exception_handler,
     general_exception_handler
 )
+from app.middleware.request_logging import RequestLoggingMiddleware
 
 # Security
 security = HTTPBearer()
@@ -79,6 +82,12 @@ async def lifespan(app: FastAPI):
     logger.info("Starting application", version=settings.API_VERSION)
     await init_db()
     logger.info("Database initialized")
+    
+    # Start system monitoring
+    from app.services.system_monitor import system_monitor
+    if getattr(settings, 'METRICS_ENABLED', True):
+        system_monitor.start_background_monitoring()
+    
     yield
     # Shutdown
     logger.info("Shutting down application")
@@ -92,6 +101,9 @@ app = FastAPI(
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url="/redoc" if settings.DEBUG else None,
 )
+
+# Request logging middleware (should be first to capture all requests)
+app.add_middleware(RequestLoggingMiddleware)
 
 # Compression middleware (should be added before CORS)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -135,15 +147,323 @@ async def health_check():
     }
 
 
+@app.get("/metrics")
+async def prometheus_metrics():
+    """
+    Prometheus metrics endpoint
+    Returns metrics in Prometheus format
+    """
+    if not getattr(settings, 'METRICS_ENABLED', True):
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content="# Metrics disabled\n", media_type="text/plain")
+    
+    from fastapi.responses import PlainTextResponse
+    
+    lines = []
+    
+    # HTTP Request Metrics
+    request_counts = metrics_service.get_request_counts()
+    for endpoint, counts in request_counts.items():
+        # Parse method and path from endpoint key (format: "METHOD /path")
+        parts = endpoint.split(' ', 1)
+        method = parts[0] if len(parts) > 0 else 'GET'
+        path = parts[1] if len(parts) > 1 else endpoint
+        
+        # Escape quotes in path for Prometheus
+        path_escaped = path.replace('"', '\\"')
+        
+        for status_code, count in counts.items():
+            lines.append(
+                f'http_requests_total{{method="{method}",endpoint="{path_escaped}",status="{status_code}"}} {count}'
+            )
+    
+    # Response Time Histogram (simplified - using percentiles)
+    response_times = metrics_service.get_response_time_stats()
+    for endpoint, stats in response_times.items():
+        # Parse method and path from endpoint key
+        parts = endpoint.split(' ', 1)
+        method = parts[0] if len(parts) > 0 else 'GET'
+        path = parts[1] if len(parts) > 1 else endpoint
+        
+        # Escape quotes in path for Prometheus
+        path_escaped = path.replace('"', '\\"')
+        
+        # Convert to seconds for Prometheus
+        for percentile, value in stats.items():
+            if percentile.startswith('p'):
+                lines.append(
+                    f'http_request_duration_seconds{{method="{method}",endpoint="{path_escaped}",quantile="{percentile}"}} {value / 1000.0}'
+                )
+        
+        # Average and max
+        if 'avg' in stats:
+            lines.append(
+                f'http_request_duration_seconds_sum{{method="{method}",endpoint="{path_escaped}"}} {stats["avg"] * stats.get("count", 1) / 1000.0}'
+            )
+            lines.append(
+                f'http_request_duration_seconds_count{{method="{method}",endpoint="{path_escaped}"}} {stats.get("count", 0)}'
+            )
+    
+    # Cache Metrics
+    cache_stats = metrics_service.get_cache_stats()
+    for cache_type, stats in cache_stats.items():
+        lines.append(f'cache_hits_total{{cache_type="{cache_type}"}} {stats["hits"]}')
+        lines.append(f'cache_misses_total{{cache_type="{cache_type}"}} {stats["misses"]}')
+        lines.append(f'cache_hit_rate{{cache_type="{cache_type}"}} {stats["hit_rate"]}')
+    
+    # System Resource Metrics
+    current_metrics = system_monitor.get_current_metrics()
+    if current_metrics:
+        memory = current_metrics.get('memory', {})
+        cpu = current_metrics.get('cpu', {})
+        
+        if memory:
+            lines.append(f'system_memory_process_bytes {memory.get("process_mb", 0) * 1024 * 1024}')
+            lines.append(f'system_memory_available_bytes {memory.get("system_available_gb", 0) * 1024 * 1024 * 1024}')
+            lines.append(f'system_memory_used_percent {memory.get("system_used_percent", 0)}')
+        
+        if cpu:
+            lines.append(f'system_cpu_process_percent {cpu.get("process_percent", 0)}')
+            lines.append(f'system_cpu_system_percent {cpu.get("system_percent", 0)}')
+    
+    # Slow Queries Count
+    slow_queries = metrics_service.get_slow_queries(limit=1)
+    lines.append(f'slow_queries_total {len(slow_queries)}')
+    
+    # Add help and type comments
+    prometheus_output = """# HELP http_requests_total Total number of HTTP requests
+# TYPE http_requests_total counter
+# HELP http_request_duration_seconds HTTP request duration in seconds
+# TYPE http_request_duration_seconds histogram
+# HELP cache_hits_total Total number of cache hits
+# TYPE cache_hits_total counter
+# HELP cache_misses_total Total number of cache misses
+# TYPE cache_misses_total counter
+# HELP cache_hit_rate Cache hit rate (0-1)
+# TYPE cache_hit_rate gauge
+# HELP system_memory_process_bytes Process memory usage in bytes
+# TYPE system_memory_process_bytes gauge
+# HELP system_memory_available_bytes Available system memory in bytes
+# TYPE system_memory_available_bytes gauge
+# HELP system_memory_used_percent System memory used percentage
+# TYPE system_memory_used_percent gauge
+# HELP system_cpu_process_percent Process CPU usage percentage
+# TYPE system_cpu_process_percent gauge
+# HELP system_cpu_system_percent System CPU usage percentage
+# TYPE system_cpu_system_percent gauge
+# HELP slow_queries_total Total number of slow queries detected
+# TYPE slow_queries_total gauge
+""" + "\n".join(lines)
+    
+    return PlainTextResponse(content=prometheus_output, media_type="text/plain")
+
+
 @app.get("/api/health")
-async def api_health():
-    """Detailed health check"""
+async def api_health(db: AsyncSession = Depends(get_db)):
+    """Detailed health check with actual service tests"""
+    import time
+    import shutil
+    from datetime import datetime, timezone
+    from sqlalchemy import text, select, func
+    from app.database import JobStatus
+    
+    overall_status = "healthy"
+    services = {}
+    
+    # Test Database Connectivity
+    db_status = "operational"
+    db_response_time_ms = 0
+    db_error = None
+    try:
+        start_time = time.time()
+        result = await db.execute(text("SELECT 1"))
+        result.scalar()  # Consume result
+        db_response_time_ms = (time.time() - start_time) * 1000
+        
+        if db_response_time_ms > 5000:  # >5s is degraded
+            db_status = "degraded"
+            overall_status = "degraded"
+    except Exception as e:
+        db_status = "down"
+        db_error = str(e)
+        overall_status = "unhealthy"
+        logger.error("Database health check failed", error=str(e))
+    
+    services["database"] = {
+        "status": db_status,
+        "response_time_ms": round(db_response_time_ms, 2),
+        "error": db_error
+    }
+    
+    # Check OpenAI API
+    openai_status = "not_configured"
+    openai_error = None
+    if settings.OPENAI_API_KEY:
+        openai_status = "configured"
+        # Optionally test connectivity (lightweight check)
+        try:
+            # Just verify key format, don't make actual API call
+            if len(settings.OPENAI_API_KEY) > 20 and settings.OPENAI_API_KEY.startswith("sk-"):
+                openai_status = "configured"
+            else:
+                openai_status = "error"
+                openai_error = "Invalid API key format"
+        except Exception as e:
+            openai_status = "error"
+            openai_error = str(e)
+    
+    services["openai"] = {
+        "status": openai_status,
+        "error": openai_error
+    }
+    
+    # Check Disk Space
+    disk_status = "ok"
+    available_gb = 0
+    used_percent = 0
+    disk_error = None
+    try:
+        upload_dir = Path(settings.UPLOAD_DIR)
+        upload_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Get disk usage
+        total, used, free = shutil.disk_usage(upload_dir)
+        available_gb = free / (1024 ** 3)  # Convert to GB
+        used_percent = (used / total) * 100
+        free_percent = (free / total) * 100
+        
+        if free_percent < settings.HEALTH_CHECK_DISK_CRITICAL_THRESHOLD:
+            disk_status = "critical"
+            overall_status = "unhealthy"
+        elif free_percent < settings.HEALTH_CHECK_DISK_WARNING_THRESHOLD:
+            disk_status = "warning"
+            if overall_status == "healthy":
+                overall_status = "degraded"
+    except Exception as e:
+        disk_status = "error"
+        disk_error = str(e)
+        logger.error("Disk space check failed", error=str(e))
+    
+    services["disk_space"] = {
+        "status": disk_status,
+        "available_gb": round(available_gb, 2),
+        "used_percent": round(used_percent, 2),
+        "free_percent": round(100 - used_percent, 2),
+        "threshold_warning": settings.HEALTH_CHECK_DISK_WARNING_THRESHOLD,
+        "threshold_critical": settings.HEALTH_CHECK_DISK_CRITICAL_THRESHOLD,
+        "error": disk_error
+    }
+    
+    # Check Background Jobs
+    jobs_status = "operational"
+    active_jobs = 0
+    failed_jobs = 0
+    pending_jobs = 0
+    jobs_error = None
+    try:
+        # Count jobs by status
+        active_query = select(func.count(JobStatus.job_id)).where(
+            JobStatus.status.in_(["processing", "running"])
+        )
+        active_result = await db.execute(active_query)
+        active_jobs = active_result.scalar() or 0
+        
+        failed_query = select(func.count(JobStatus.job_id)).where(
+            JobStatus.status == "failed"
+        )
+        failed_result = await db.execute(failed_query)
+        failed_jobs = failed_result.scalar() or 0
+        
+        pending_query = select(func.count(JobStatus.job_id)).where(
+            JobStatus.status.in_(["pending", "queued"])
+        )
+        pending_result = await db.execute(pending_query)
+        pending_jobs = pending_result.scalar() or 0
+        
+        # If too many failed jobs, mark as degraded
+        if failed_jobs > 10:
+            jobs_status = "degraded"
+            if overall_status == "healthy":
+                overall_status = "degraded"
+    except Exception as e:
+        jobs_status = "error"
+        jobs_error = str(e)
+        logger.error("Background jobs check failed", error=str(e))
+    
+    services["background_jobs"] = {
+        "status": jobs_status,
+        "active": active_jobs,
+        "failed": failed_jobs,
+        "pending": pending_jobs,
+        "error": jobs_error
+    }
+    
     return {
-        "status": "healthy",
-        "services": {
-            "database": "operational",
-            "openai": "configured" if settings.OPENAI_API_KEY else "not_configured"
-        }
+        "status": overall_status,
+        "version": settings.API_VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": services
+    }
+
+
+@app.get("/api/metrics")
+async def get_performance_metrics(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    """
+    Get performance metrics in JSON format for dashboard
+    Requires authentication
+    """
+    # Verify authentication
+    try:
+        payload = AuthService.verify_token(credentials.credentials)
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    
+    if not getattr(settings, 'METRICS_ENABLED', True):
+        raise HTTPException(status_code=404, detail="Metrics disabled")
+    
+    # Get response time statistics
+    response_times = metrics_service.get_response_time_stats()
+    
+    # Get slow queries
+    slow_queries = metrics_service.get_slow_queries(limit=100)
+    
+    # Get system resources
+    system_resources = system_monitor.get_current_metrics()
+    
+    # Get cache statistics
+    cache_stats = metrics_service.get_cache_stats()
+    
+    # Get top endpoints
+    top_endpoints = metrics_service.get_top_endpoints(limit=10)
+    
+    # Get error rates
+    error_rates = metrics_service.get_error_rates()
+    
+    # Import timezone here to avoid circular import issues
+    from datetime import timezone
+    
+    return {
+        "response_times": response_times,
+        "slow_queries": slow_queries,
+        "system_resources": {
+            "memory": system_resources.get("memory", {}),
+            "cpu": system_resources.get("cpu", {}),
+            "disk_io": system_resources.get("disk_io", {}),
+            "network_io": system_resources.get("network_io", {}),
+            "process": system_resources.get("process", {})
+        },
+        "cache_stats": cache_stats,
+        "top_endpoints": [
+            {"endpoint": endpoint, "total_requests": count}
+            for endpoint, count in top_endpoints
+        ],
+        "error_rates": error_rates,
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 
@@ -712,6 +1032,9 @@ async def upload_video(
                    file_path=str(file_path))
         background_tasks.add_task(process_video_task, str(file_path), job_id, str(video_upload.id))
         
+        # Invalidate user's video panel cache since a new video was added
+        CacheService.invalidate_user_cache(current_user.id)
+        
         return VideoUploadResponse.model_validate(video_upload)
     except HTTPException:
         raise
@@ -752,8 +1075,8 @@ async def download_document(
         raise HTTPException(status_code=400, detail="Processing not completed yet")
     
     # Validate format
-    if format not in ["docx", "pdf", "html"]:
-        raise HTTPException(status_code=400, detail="Invalid format. Allowed: docx, pdf, html")
+    if format not in ["docx", "html"]:
+        raise HTTPException(status_code=400, detail="Invalid format. Allowed: docx, html")
     
     # Get output file path
     output_file = OUTPUT_DIR / f"{job_id}.{format}"
@@ -858,8 +1181,28 @@ async def get_videos_panel(
     Returns videos with frame analysis statistics, suitable for displaying
     in a table/list panel similar to document management interfaces.
     """
+    # Generate cache key
+    tags_list = [t.strip() for t in tags.split(',')] if tags else None
+    cache_key = CacheService._generate_cache_key(
+        prefix="video_panel",
+        user_id=current_user.id,
+        page=page,
+        page_size=page_size,
+        status=status,
+        application_name=application_name,
+        language_code=language_code,
+        priority=priority,
+        tags=tags_list,
+        sort_by=sort_by,
+        sort_order=sort_order
+    )
+    
+    # Try to get from cache
+    cached_response = CacheService.get(cache_key, "video_panel")
+    if cached_response is not None:
+        return cached_response
+    
     # Parse tags if provided
-    tags_list = None
     if tags:
         tags_list = [t.strip() for t in tags.split(',')]
     
@@ -907,13 +1250,18 @@ async def get_videos_panel(
         for video in videos_data
     ]
     
-    return VideoPanelResponse(
+    response = VideoPanelResponse(
         videos=videos,
         total=total,
         page=page,
         page_size=page_size,
         has_more=(page * page_size) < total
     )
+    
+    # Cache the response
+    CacheService.set(cache_key, response, "video_panel")
+    
+    return response
 
 
 @app.patch("/api/uploads/{upload_id}", response_model=VideoUploadResponse)
@@ -953,6 +1301,10 @@ async def update_upload_metadata(
     if not updated_upload:
         raise HTTPException(status_code=404, detail="Video upload not found")
     
+    # Invalidate cache for this video and user's video panel
+    CacheService.invalidate_video_cache(video_id=upload_id, video_file_number=updated_upload.video_file_number)
+    CacheService.invalidate_user_cache(current_user.id)
+    
     # Log activity
     await ActivityService.log_activity(
         db=db,
@@ -986,6 +1338,14 @@ async def delete_upload(
     
     if not success:
         raise HTTPException(status_code=404, detail="Video upload not found")
+    
+    # Get video info before deletion for cache invalidation
+    upload = await VideoUploadService.get_upload(db, upload_id, current_user.id)
+    video_file_number = upload.video_file_number if upload else None
+    
+    # Invalidate cache for this video and user's video panel
+    CacheService.invalidate_video_cache(video_id=upload_id, video_file_number=video_file_number)
+    CacheService.invalidate_user_cache(current_user.id)
     
     # Log activity
     await ActivityService.log_activity(
@@ -1023,6 +1383,11 @@ async def bulk_delete_uploads(
         user_id=current_user.id,
         permanent=delete_request.permanent
     )
+    
+    # Invalidate cache for all deleted videos and user's video panel
+    for upload_id in upload_uuids:
+        CacheService.invalidate_video_cache(video_id=upload_id)
+    CacheService.invalidate_user_cache(current_user.id)
     
     # Log activity
     action = "BULK_HARD_DELETE_VIDEO" if delete_request.permanent else "BULK_DELETE_VIDEO"
@@ -1315,9 +1680,21 @@ async def get_activity_stats(
     db: AsyncSession = Depends(get_db)
 ):
     """Get activity statistics for the current user"""
+    # Generate cache key
+    cache_key = CacheService._generate_cache_key(
+        prefix="activity_stats",
+        user_id=current_user.id,
+        days=days
+    )
+    
+    # Try to get from cache
+    cached_response = CacheService.get(cache_key, "activity_stats")
+    if cached_response is not None:
+        return cached_response
+    
     stats = await ActivityService.get_activity_stats(db, current_user.id, days=days)
     
-    return ActivityLogStatsResponse(
+    response = ActivityLogStatsResponse(
         total_activities=stats["total_activities"],
         activities_by_action=stats["activities_by_action"],
         recent_activities=[
@@ -1332,6 +1709,11 @@ async def get_activity_stats(
             ) for log in stats["recent_activities"]
         ]
     )
+    
+    # Cache the response
+    CacheService.set(cache_key, response, "activity_stats")
+    
+    return response
 
 
 @app.get("/api/activity-logs/actions", response_model=List[str])
@@ -1661,20 +2043,39 @@ async def get_audio_file(
 async def get_document_by_file_number(
     request: Request,
     video_file_number: str,
+    include_images: bool = Query(True, description="Include base64 images in response (can be slow for many frames)"),
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     Get complete document/data for a video file number
     
     Returns all frame analyses, GPT responses, video metadata, and summary statistics.
     This is the main endpoint to fetch all data for a video file once processing is complete.
+    
+    Args:
+        include_images: If False, excludes base64_image from response (faster, smaller payload)
     """
-    # Get complete document data
+    # Generate cache key (include include_images in key to cache separately)
+    cache_key = CacheService._generate_cache_key(
+        prefix="document_data",
+        user_id=current_user.id,
+        video_file_number=video_file_number,
+        include_images=include_images
+    )
+    
+    # Try to get from cache
+    cached_response = CacheService.get(cache_key, "document_data")
+    if cached_response is not None:
+        return cached_response
+    
+    # Get complete document data (with option to exclude images for faster response)
     document_data = await frame_analysis_service.get_complete_document_data(
         db=db,
         video_file_number=video_file_number,
-        user_id=current_user.id
+        user_id=current_user.id,
+        include_base64_images=include_images
     )
     
     if not document_data:
@@ -1683,29 +2084,27 @@ async def get_document_by_file_number(
     upload = document_data["video_metadata"]
     frames = document_data["frames"]
     
-    # Get transcript from job status if job_id exists
+    # Get transcript from job status if job_id exists (optimize: only fetch transcript field)
     transcript = None
     if upload.job_id:
-        job = await JobService.get_job(db, upload.job_id)
-        if job and job.transcript:
-            transcript = job.transcript
+        from app.database import JobStatus
+        from sqlalchemy import select
+        job_query = select(JobStatus.transcript).where(JobStatus.job_id == upload.job_id)
+        job_result = await db.execute(job_query)
+        transcript = job_result.scalar_one_or_none()
     
-    # Log activity
-    await ActivityService.log_activity(
-        db=db,
+    # Log activity in background (non-blocking) to reduce latency
+    background_tasks.add_task(
+        _log_document_fetch_activity,
         user_id=current_user.id,
-        action="FETCH_DOCUMENT",
-        description=f"User fetched document for video: {video_file_number}",
-        metadata={
-            "video_file_number": video_file_number,
-            "video_id": str(upload.id),
-            "total_frames": document_data["total_frames"],
-            "frames_with_gpt": document_data["frames_with_gpt"]
-        },
+        video_file_number=video_file_number,
+        video_id=str(upload.id),
+        total_frames=document_data["total_frames"],
+        frames_with_gpt=document_data["frames_with_gpt"],
         ip_address=get_client_ip(request)
     )
     
-    return DocumentResponse(
+    response = DocumentResponse(
         video_file_number=video_file_number,
         video_metadata=VideoMetadata(
             video_id=upload.id,
@@ -1722,7 +2121,6 @@ async def get_document_by_file_number(
             language_code=upload.language_code,
             priority=upload.priority,
             audio_url=upload.audio_url,
-            summary_pdf_url=upload.summary_pdf_url,
             created_at=upload.created_at,
             updated_at=upload.updated_at
         ),
@@ -1744,213 +2142,44 @@ async def get_document_by_file_number(
         ],
         summary=document_data["summary"],
         transcript=transcript,
-        summary_pdf_url=upload.summary_pdf_url,
         created_at=datetime.utcnow()
     )
-
-
-@app.get("/api/videos/{video_id}/summaries")
-async def get_video_summaries(
-    video_id: UUID,
-    request: Request,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Get all summaries for a video
     
-    Returns list of batch summaries generated from frame analyses.
-    """
-    try:
-        # Verify video belongs to user
-        from app.services.video_upload_service import VideoUploadService
-        video_upload = await VideoUploadService.get_upload(db, video_id, current_user.id)
-        
-        if not video_upload:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        # Get summaries
-        summary_service = SummaryService()
-        summaries = await summary_service.get_video_summaries(db, video_id)
-        
-        # Log activity
-        await ActivityService.log_activity(
-            db=db,
-            user_id=current_user.id,
-            action="FETCH_SUMMARIES",
-            description=f"User fetched summaries for video: {video_upload.video_file_number}",
-            metadata={
-                "video_id": str(video_id),
-                "video_file_number": video_upload.video_file_number,
-                "total_summaries": len(summaries)
-            },
-            ip_address=get_client_ip(request)
-        )
-        
-        return {
-            "video_id": str(video_id),
-            "video_file_number": video_upload.video_file_number,
-            "total_summaries": len(summaries),
-            "summaries": summaries
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Failed to get video summaries",
-                   video_id=str(video_id),
-                   error=str(e),
-                   exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to get summaries: {str(e)}")
-
-
-@app.post("/api/videos/{video_id}/summaries/generate")
-async def generate_video_summaries(
-    video_id: UUID,
-    request: Request,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Manually trigger summary generation for a video
+    # Cache the response (only if status is completed to avoid caching incomplete data)
+    if upload.status == "completed":
+        CacheService.set(cache_key, response, "document_data")
     
-    This will process all frame analyses in batches of 30 and generate summaries.
-    """
-    try:
-        # Verify video belongs to user
-        from app.services.video_upload_service import VideoUploadService
-        video_upload = await VideoUploadService.get_upload(db, video_id, current_user.id)
-        
-        if not video_upload:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        # Generate summaries
-        summary_service = SummaryService()
-        summaries = await summary_service.generate_video_summaries(db, video_id)
-        
-        # Log activity
-        await ActivityService.log_activity(
-            db=db,
-            user_id=current_user.id,
-            action="GENERATE_SUMMARIES",
-            description=f"User generated summaries for video: {video_upload.video_file_number}",
-            metadata={
-                "video_id": str(video_id),
-                "video_file_number": video_upload.video_file_number,
-                "total_summaries": len(summaries)
-            },
-            ip_address=get_client_ip(request)
-        )
-        
-        return {
-            "video_id": str(video_id),
-            "video_file_number": video_upload.video_file_number,
-            "total_summaries": len(summaries),
-            "summaries": summaries,
-            "message": f"Successfully generated {len(summaries)} summaries"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Failed to generate video summaries",
-                   video_id=str(video_id),
-                   error=str(e),
-                   exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to generate summaries: {str(e)}")
+    return response
 
 
-@app.get("/api/videos/{video_id}/summary-pdf")
-async def download_summary_pdf(
-    video_id: UUID,
-    request: Request,
-    token: Optional[str] = Query(None, description="Optional token for iframe access"),
-    current_user: Optional[User] = Depends(lambda: None),  # Make optional for token-based access
-    db: AsyncSession = Depends(get_db)
+async def _log_document_fetch_activity(
+    user_id: UUID,
+    video_file_number: str,
+    video_id: str,
+    total_frames: int,
+    frames_with_gpt: int,
+    ip_address: Optional[str]
 ):
-    """
-    Download the generated summary PDF for a video
-    Supports both Bearer token and query parameter token for iframe access
-    """
+    """Background task to log document fetch activity without blocking response"""
     try:
-        from app.services.video_upload_service import VideoUploadService
-        from app.services.auth_service import AuthService
-        
-        # Handle authentication - either from current_user or token parameter
-        user_id = None
-        if current_user:
-            user_id = current_user.id
-        elif token:
-            # Verify token and get user
-            try:
-                user_data = AuthService.verify_token(token)
-                if user_data:
-                    user_id = UUID(user_data.get("sub"))  # JWT sub claim contains user_id
-            except Exception as token_error:
-                logger.warning("Token verification failed", error=str(token_error))
-        
-        if not user_id:
-            # Try to get user from Authorization header if token param failed
-            auth_header = request.headers.get("Authorization")
-            if auth_header and auth_header.startswith("Bearer "):
-                try:
-                    token_from_header = auth_header.split(" ")[1]
-                    user_data = AuthService.verify_token(token_from_header)
-                    if user_data:
-                        user_id = UUID(user_data.get("sub"))
-                except Exception:
-                    pass
-        
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Not authenticated")
-        
-        # Verify video belongs to user
-        video_upload = await VideoUploadService.get_upload(db, video_id, user_id)
-        
-        if not video_upload:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        if not video_upload.summary_pdf_url:
-            raise HTTPException(status_code=404, detail="Summary PDF not found for this video")
-        
-        # Get PDF path
-        pdf_path = Path(video_upload.summary_pdf_url)
-        
-        # If it's a relative path, resolve it relative to OUTPUT_DIR
-        if not pdf_path.is_absolute():
-            pdf_path = settings.OUTPUT_DIR / pdf_path
-        
-        if not pdf_path.exists():
-            raise HTTPException(status_code=404, detail="Summary PDF file not found on server")
-        
-        # Log activity
-        if user_id:
+        from app.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
             await ActivityService.log_activity(
-                db=db,
+                db=session,
                 user_id=user_id,
-                action="DOWNLOAD_SUMMARY_PDF",
-                description=f"User downloaded summary PDF for video: {video_upload.video_file_number}",
+                action="FETCH_DOCUMENT",
+                description=f"User fetched document for video: {video_file_number}",
                 metadata={
-                    "video_id": str(video_id),
-                    "video_file_number": video_upload.video_file_number
+                    "video_file_number": video_file_number,
+                    "video_id": video_id,
+                    "total_frames": total_frames,
+                    "frames_with_gpt": frames_with_gpt
                 },
-                ip_address=get_client_ip(request)
+                ip_address=ip_address
             )
-        
-        return FileResponse(
-            path=str(pdf_path),
-            filename=f"video_summary_{video_upload.video_file_number}.pdf",
-            media_type="application/pdf"
-        )
-        
-    except HTTPException:
-        raise
+            await session.commit()
     except Exception as e:
-        logger.error("Failed to download summary PDF",
-                   video_id=str(video_id),
-                   error=str(e),
-                   exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to download PDF: {str(e)}")
+        logger.warning("Failed to log document fetch activity", error=str(e))
 
 
 async def log_upload_activity(
@@ -2153,11 +2382,69 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
             
             # Update video upload status to completed
             try:
-                await VideoUploadService.update_upload_status(db, video_uuid, "completed", job_id)
+                # Ensure we have a fresh database session for this update to avoid connection busy errors
+                await db.commit()  # Commit any pending changes first
+                
+                updated_upload = await VideoUploadService.update_upload_status(db, video_uuid, "completed", job_id)
+                if updated_upload:
+                    logger.info("Video upload status updated to completed", 
+                               upload_id=str(upload_id),
+                               video_id=str(video_uuid),
+                               status=updated_upload.status)
+                    # Invalidate cache for this video and user's video panel
+                    if user_id:
+                        CacheService.invalidate_video_cache(
+                            video_id=video_uuid, 
+                            video_file_number=updated_upload.video_file_number if hasattr(updated_upload, 'video_file_number') else None
+                        )
+                        CacheService.invalidate_user_cache(user_id)
+                else:
+                    logger.warning("Video upload not found when updating status", 
+                                  upload_id=str(upload_id),
+                                  video_id=str(video_uuid))
+                    # Try to update directly if the service method didn't work
+                    from sqlalchemy import update
+                    from app.database import VideoUpload
+                    # Flush before update for SQL Server
+                    await db.flush()
+                    result = await db.execute(
+                        update(VideoUpload)
+                        .where(VideoUpload.id == video_uuid)
+                        .values(status="completed")
+                    )
+                    await db.flush()
+                    await db.commit()
+                    logger.info("Video upload status updated directly to completed", 
+                               upload_id=str(upload_id),
+                               video_id=str(video_uuid),
+                               rows_affected=result.rowcount)
             except Exception as e:
                 logger.error("Failed to update video upload status", 
                            upload_id=upload_id, 
-                           error=str(e))
+                           video_id=str(video_uuid),
+                           error=str(e),
+                           exc_info=True)
+                # Try to update directly as fallback
+                try:
+                    from sqlalchemy import update
+                    from app.database import VideoUpload
+                    # Ensure we flush before update for SQL Server
+                    await db.flush()
+                    result = await db.execute(
+                        update(VideoUpload)
+                        .where(VideoUpload.id == video_uuid)
+                        .values(status="completed")
+                    )
+                    await db.commit()
+                    logger.info("Video upload status updated via fallback method", 
+                               upload_id=str(upload_id),
+                               video_id=str(video_uuid),
+                               rows_affected=result.rowcount)
+                except Exception as fallback_error:
+                    logger.error("Fallback status update also failed", 
+                               upload_id=str(upload_id),
+                               video_id=str(video_uuid),
+                               error=str(fallback_error))
             
             logger.info("Video processing completed successfully", 
                        job_id=job_id, 

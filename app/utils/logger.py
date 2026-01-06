@@ -12,6 +12,12 @@ def configure_logging():
         level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
     )
     
+    # Reduce SQLAlchemy engine logging to WARNING (only show errors/warnings)
+    # This reduces log noise from database queries while keeping important database errors visible
+    logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
+    logging.getLogger('sqlalchemy.pool').setLevel(logging.WARNING)
+    logging.getLogger('sqlalchemy.dialects').setLevel(logging.WARNING)
+    
     processors = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,

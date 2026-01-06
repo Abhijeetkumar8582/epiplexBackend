@@ -1,11 +1,6 @@
 from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from pathlib import Path
 from typing import List, Dict
 import os
@@ -27,10 +22,6 @@ class DocumentGenerator:
         # Generate DOCX
         docx_path = self._generate_docx(job_id, transcript, frame_analyses, output_dir)
         output_paths["docx"] = str(docx_path)
-        
-        # Generate PDF
-        pdf_path = self._generate_pdf(job_id, transcript, frame_analyses, output_dir)
-        output_paths["pdf"] = str(pdf_path)
         
         # Generate HTML
         html_path = self._generate_html(job_id, transcript, frame_analyses, output_dir)
@@ -74,70 +65,6 @@ class DocumentGenerator:
         # Save document
         output_path = output_dir / f"{job_id}.docx"
         doc.save(str(output_path))
-        return output_path
-    
-    def _generate_pdf(
-        self,
-        job_id: str,
-        transcript: str,
-        frame_analyses: List[Dict],
-        output_dir: Path
-    ) -> Path:
-        """Generate PDF document"""
-        output_path = output_dir / f"{job_id}.pdf"
-        doc = SimpleDocTemplate(str(output_path), pagesize=letter)
-        styles = getSampleStyleSheet()
-        
-        # Custom styles
-        title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=styles['Heading1'],
-            fontSize=24,
-            textColor='black',
-            spaceAfter=30,
-            alignment=TA_CENTER
-        )
-        
-        heading_style = ParagraphStyle(
-            'CustomHeading',
-            parent=styles['Heading2'],
-            fontSize=16,
-            textColor='black',
-            spaceAfter=12,
-            spaceBefore=12
-        )
-        
-        timestamp_style = ParagraphStyle(
-            'Timestamp',
-            parent=styles['Normal'],
-            fontSize=12,
-            textColor='black',
-            fontName='Helvetica-Bold',
-            spaceAfter=6
-        )
-        
-        # Build content
-        story = []
-        
-        # Title
-        story.append(Paragraph('Video Processing Report', title_style))
-        story.append(Spacer(1, 0.5*inch))
-        
-        # Transcript
-        story.append(Paragraph('Transcript', heading_style))
-        story.append(Paragraph(transcript, styles['Normal']))
-        story.append(Spacer(1, 0.3*inch))
-        
-        # Frame analyses
-        story.append(Paragraph('Frame-by-Frame Analysis', heading_style))
-        
-        for analysis in frame_analyses:
-            story.append(Paragraph(f"Time: {analysis['timestamp']}", timestamp_style))
-            story.append(Paragraph(analysis['description'], styles['Normal']))
-            story.append(Spacer(1, 0.2*inch))
-        
-        # Build PDF
-        doc.build(story)
         return output_path
     
     def _generate_html(

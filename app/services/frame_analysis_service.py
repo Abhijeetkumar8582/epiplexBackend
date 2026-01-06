@@ -215,7 +215,8 @@ class FrameAnalysisService:
         self,
         db: AsyncSession,
         video_file_number: str,
-        user_id: Optional[UUID] = None
+        user_id: Optional[UUID] = None,
+        include_base64_images: bool = True
     ) -> Dict[str, Any]:
         """
         Get complete document data for a video file number
@@ -241,35 +242,52 @@ class FrameAnalysisService:
         if not upload:
             return None
         
+        # Calculate statistics using SQL aggregations (much faster than Python loops)
+        stats_query = select(
+            func.count(FrameAnalysis.id).label('total_frames'),
+            func.count(FrameAnalysis.gpt_response).label('frames_with_gpt'),
+            func.count(FrameAnalysis.ocr_text).label('frames_with_ocr'),
+            func.count(FrameAnalysis.description).label('frames_with_description'),
+            func.avg(FrameAnalysis.processing_time_ms).label('avg_processing_time'),
+            func.min(FrameAnalysis.timestamp).label('first_frame_timestamp'),
+            func.max(FrameAnalysis.timestamp).label('last_frame_timestamp')
+        ).where(FrameAnalysis.video_id == upload.id)
+        
+        stats_result = await db.execute(stats_query)
+        stats = stats_result.first()
+        
+        total_frames = stats.total_frames or 0
+        frames_with_gpt = stats.frames_with_gpt or 0
+        frames_with_ocr = stats.frames_with_ocr or 0
+        frames_with_description = stats.frames_with_description or 0
+        avg_processing_time = float(stats.avg_processing_time or 0)
+        first_frame_timestamp = stats.first_frame_timestamp
+        last_frame_timestamp = stats.last_frame_timestamp
+        
         # Get all frame analyses for this video
-        frames_query = select(FrameAnalysis).where(
-            FrameAnalysis.video_id == upload.id
-        ).order_by(FrameAnalysis.timestamp)
+        # Optimize: Use defer() to exclude base64_image from query when not needed
+        # This avoids loading large base64 data from database entirely
+        if include_base64_images:
+            frames_query = select(FrameAnalysis).where(
+                FrameAnalysis.video_id == upload.id
+            ).order_by(FrameAnalysis.timestamp)
+        else:
+            # Use defer to exclude base64_image column from loading
+            # This significantly reduces database transfer time and memory usage
+            from sqlalchemy.orm import defer
+            frames_query = select(FrameAnalysis).options(
+                defer(FrameAnalysis.base64_image)
+            ).where(
+                FrameAnalysis.video_id == upload.id
+            ).order_by(FrameAnalysis.timestamp)
         
         frames_result = await db.execute(frames_query)
         frames = list(frames_result.scalars().all())
         
-        # Calculate statistics
-        total_frames = len(frames)
-        frames_with_gpt = sum(1 for f in frames if f.gpt_response is not None)
-        
-        # Calculate summary statistics
-        if frames:
-            avg_processing_time = sum(
-                (f.processing_time_ms or 0) for f in frames
-            ) / total_frames if total_frames > 0 else 0
-            
-            first_frame_timestamp = min(f.timestamp for f in frames)
-            last_frame_timestamp = max(f.timestamp for f in frames)
-            
-            frames_with_ocr = sum(1 for f in frames if f.ocr_text)
-            frames_with_description = sum(1 for f in frames if f.description)
-        else:
-            avg_processing_time = 0
-            first_frame_timestamp = None
-            last_frame_timestamp = None
-            frames_with_ocr = 0
-            frames_with_description = 0
+        # Ensure base64_image is None when not included (defer sets it to None)
+        if not include_base64_images:
+            for frame in frames:
+                frame.base64_image = None
         
         return {
             "video_file_number": video_file_number,

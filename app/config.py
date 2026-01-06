@@ -78,6 +78,27 @@ class Settings(BaseSettings):
     # Background Tasks
     MAX_WORKERS: int = 4
     
+    # Cache Settings
+    CACHE_ENABLED: bool = True
+    CACHE_DEFAULT_TTL: int = 120  # Default TTL in seconds (2 minutes)
+    
+    # Request Logging Settings
+    REQUEST_LOGGING_ENABLED: bool = True
+    REQUEST_LOGGING_SLOW_THRESHOLD_MS: int = 1000  # Log as slow if >1s
+    REQUEST_LOGGING_LOG_TO_ACTIVITY: bool = True  # Log to activity log
+    REQUEST_LOGGING_SKIP_PATHS: List[str] = ["/health", "/api/health", "/docs", "/redoc", "/openapi.json"]
+    
+    # Health Check Settings
+    HEALTH_CHECK_DISK_WARNING_THRESHOLD: float = 10.0  # Warn if <10% free
+    HEALTH_CHECK_DISK_CRITICAL_THRESHOLD: float = 5.0   # Critical if <5% free
+    
+    # Performance Monitoring Settings
+    METRICS_ENABLED: bool = True
+    METRICS_RETENTION_HOURS: int = 24
+    SLOW_QUERY_THRESHOLD_MS: int = 500
+    SYSTEM_MONITOR_INTERVAL_SECONDS: int = 30
+    METRICS_PERCENTILES: List[float] = [0.5, 0.75, 0.9, 0.95, 0.99]
+    
     @field_validator('CORS_ORIGINS', mode='before')
     @classmethod
     def parse_cors_origins(cls, v):

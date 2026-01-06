@@ -64,6 +64,9 @@ class JobService:
             if _is_sql_server:
                 # Flush any pending operations before starting new query
                 await db.flush()
+                # Small delay to ensure connection is ready
+                import asyncio
+                await asyncio.sleep(0.01)
             
             await db.execute(
                 update(JobStatus)
@@ -74,12 +77,35 @@ class JobService:
             if _is_sql_server:
                 # For SQL Server, flush before commit to avoid connection busy errors
                 await db.flush()
+                # Small delay before commit
+                import asyncio
+                await asyncio.sleep(0.01)
             
             await db.commit()
         except Exception as e:
             await db.rollback()
-            logger.error(f"Failed to update job status: {str(e)}", job_id=job_id, exc_info=True)
-            raise
+            # If it's a connection busy error, retry once after a short delay
+            if _is_sql_server and "busy with results" in str(e).lower():
+                logger.warning("Connection busy error detected, retrying after delay", job_id=job_id)
+                import asyncio
+                await asyncio.sleep(0.1)
+                try:
+                    await db.flush()
+                    await db.execute(
+                        update(JobStatus)
+                        .where(JobStatus.job_id == job_id)
+                        .values(**updates)
+                    )
+                    await db.flush()
+                    await db.commit()
+                    logger.info("Job update succeeded on retry", job_id=job_id)
+                except Exception as retry_error:
+                    await db.rollback()
+                    logger.error(f"Failed to update job status on retry: {str(retry_error)}", job_id=job_id, exc_info=True)
+                    raise
+            else:
+                logger.error(f"Failed to update job status: {str(e)}", job_id=job_id, exc_info=True)
+                raise
         
         # Don't fetch again for SQL Server to avoid connection busy errors
         # Just return None or log the update
