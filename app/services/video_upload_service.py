@@ -194,6 +194,11 @@ class VideoUploadService:
                 query = query.where(VideoUpload.tags.contains([tag]))
         
         # Get total count
+        # For SQL Server, ensure we flush any pending operations before count query
+        from app.database import _is_sql_server
+        if _is_sql_server:
+            await db.flush()
+        
         count_query = select(func.count()).select_from(VideoUpload).where(VideoUpload.user_id == user_id)
         if not include_deleted:
             count_query = count_query.where(VideoUpload.is_deleted == False)
@@ -211,6 +216,10 @@ class VideoUploadService:
         
         total_result = await db.execute(count_query)
         total = total_result.scalar_one()
+        
+        # For SQL Server, ensure count result is fully consumed before next query
+        if _is_sql_server:
+            await db.flush()
         
         # Apply sorting
         if sort_by == "updated_at":
@@ -234,6 +243,10 @@ class VideoUploadService:
         
         result = await db.execute(query)
         uploads = list(result.scalars().all())
+        
+        # For SQL Server, ensure uploads query result is fully consumed before next query
+        if _is_sql_server:
+            await db.flush()
         
         # Get frame stats for each upload
         video_ids = [upload.id for upload in uploads]
@@ -268,13 +281,18 @@ class VideoUploadService:
             
             try:
                 frame_stats_result = await db.execute(frame_stats_query)
+                # For SQL Server, ensure we fully consume the result
+                frame_stats_rows = frame_stats_result.all()
                 frame_stats = {
                     row.video_id: {
                         'total_frames': row.total_frames or 0,
                         'frames_with_gpt': row.frames_with_gpt or 0
                     }
-                    for row in frame_stats_result.all()
+                    for row in frame_stats_rows
                 }
+                # For SQL Server, flush after consuming result
+                if _is_sql_server:
+                    await db.flush()
             except Exception as e:
                 # If frame_analyses table doesn't exist, return empty stats
                 logger.warning(f"Could not fetch frame stats (table may not exist): {e}")

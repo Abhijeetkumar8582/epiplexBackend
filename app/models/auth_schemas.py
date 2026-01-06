@@ -26,6 +26,8 @@ class UserResponse(BaseModel):
     role: str
     is_active: bool
     last_login_at: Optional[datetime] = None
+    frame_analysis_prompt: Optional[str] = None
+    openai_api_key: Optional[str] = None  # Note: Should be masked in responses
     created_at: datetime
     updated_at: datetime
 

@@ -2,7 +2,7 @@
 import base64
 import time
 import json
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 import numpy as np
 from pathlib import Path
 import aiofiles
@@ -58,6 +58,81 @@ Frame timestamp: {timestamp} seconds"""
 3. Identify any important information or data displayed
 
 Frame timestamp: {timestamp} seconds"""
+    
+    def _extract_analysis_rules(self, prompt: str) -> str:
+        """Extract only the editable content within ANALYSIS RULES section (excluding header and separator)"""
+        try:
+            # Find the ANALYSIS RULES section
+            start_marker = "### 🔍 **ANALYSIS RULES**"
+            
+            start_idx = prompt.find(start_marker)
+            if start_idx == -1:
+                return ""
+            
+            # Find the content after the header (skip the header line and any blank lines)
+            content_start = start_idx + len(start_marker)
+            remaining = prompt[content_start:]
+            
+            # Skip leading newlines/whitespace
+            remaining = remaining.lstrip('\n\r')
+            
+            # Find the next "---" separator (this marks the end of ANALYSIS RULES)
+            # Look for "\n---\n" pattern
+            end_marker = "\n---\n"
+            end_idx = remaining.find(end_marker)
+            
+            if end_idx == -1:
+                # If no separator found, try finding next "###" section
+                end_idx = remaining.find("\n### ")
+                if end_idx == -1:
+                    # If still not found, take until end (but strip trailing "---" if present)
+                    content = remaining.rstrip()
+                    if content.endswith("---"):
+                        content = content[:-3].rstrip()
+                    return content
+            
+            # Extract content between header and separator (excluding the separator)
+            content = remaining[:end_idx].strip()
+            return content
+        except Exception as e:
+            logger.error("Failed to extract analysis rules", error=str(e))
+            return ""
+    
+    def _build_full_prompt(self, analysis_rules_content: str) -> str:
+        """Build full prompt by combining fixed parts with custom ANALYSIS RULES content"""
+        full_template = self.prompt_template
+        
+        # Find the ANALYSIS RULES section in the template
+        start_marker = "### 🔍 **ANALYSIS RULES**"
+        
+        start_idx = full_template.find(start_marker)
+        if start_idx == -1:
+            # If marker not found, return template as-is
+            logger.warning("ANALYSIS RULES marker not found in template")
+            return full_template
+        
+        # Find the content after the header
+        content_start = start_idx + len(start_marker)
+        remaining = full_template[content_start:].lstrip('\n\r')
+        
+        # Find the "---" separator that marks the end of ANALYSIS RULES
+        end_marker = "\n---\n"
+        end_idx = remaining.find(end_marker)
+        
+        if end_idx == -1:
+            # Try finding next "###" section
+            end_idx = remaining.find("\n### ")
+            if end_idx == -1:
+                # If no end marker found, replace content from start to end
+                before = full_template[:content_start]
+                return before + "\n\n" + analysis_rules_content + "\n" + remaining
+        
+        # Replace only the content between header and separator
+        before = full_template[:content_start]
+        after = remaining[end_idx:]  # Includes the "---\n" separator
+        
+        # Build the full section: header + custom content + separator
+        return before + "\n\n" + analysis_rules_content + after
     
     def _encode_image(self, image_path: str) -> str:
         """Encode image to base64"""
@@ -129,11 +204,105 @@ Frame timestamp: {timestamp} seconds"""
         
         return json_str.strip()
     
+    async def get_prompt_template(self, user_id: Optional[str] = None, db: Optional[Any] = None) -> str:
+        """
+        Get prompt template - use user's custom ANALYSIS RULES if available, otherwise use default
+        
+        Args:
+            user_id: Optional user ID to fetch custom ANALYSIS RULES
+            db: Optional database session to fetch user prompt
+        
+        Returns:
+            Full prompt template string with custom ANALYSIS RULES if available
+        """
+        # If user_id and db are provided, try to get user's custom ANALYSIS RULES
+        if user_id and db:
+            try:
+                from app.database import User
+                from sqlalchemy import select
+                from uuid import UUID
+                
+                # Convert user_id to UUID if it's a string
+                if isinstance(user_id, str):
+                    user_uuid = UUID(user_id)
+                else:
+                    user_uuid = user_id
+                
+                # Query user's custom ANALYSIS RULES
+                result = await db.execute(
+                    select(User.frame_analysis_prompt).where(User.id == user_uuid)
+                )
+                custom_analysis_rules = result.scalar_one_or_none()
+                
+                if custom_analysis_rules:
+                    logger.info("Using custom user ANALYSIS RULES", user_id=str(user_id))
+                    # Build full prompt with custom ANALYSIS RULES
+                    return self._build_full_prompt(custom_analysis_rules)
+            except Exception as e:
+                logger.warning("Failed to fetch user custom ANALYSIS RULES, using default", 
+                             user_id=str(user_id), error=str(e))
+        
+        # Fall back to default prompt
+        return self.prompt_template
+    
+    def get_default_analysis_rules(self) -> str:
+        """Get the default ANALYSIS RULES section from the template"""
+        return self._extract_analysis_rules(self.prompt_template)
+
+    async def _get_openai_client(self, user_id: Optional[str] = None, db: Optional[Any] = None) -> Optional[AsyncOpenAI]:
+        """
+        Get OpenAI client - use user's API key if available, otherwise use system default
+        
+        Args:
+            user_id: Optional user ID to fetch custom API key
+            db: Optional database session to fetch user API key
+        
+        Returns:
+            AsyncOpenAI client instance or None
+        """
+        # If user_id and db are provided, try to get user's custom API key
+        if user_id and db:
+            try:
+                from app.database import User
+                from sqlalchemy import select
+                from uuid import UUID
+                from app.utils.encryption import EncryptionService
+                
+                # Convert user_id to UUID if it's a string
+                if isinstance(user_id, str):
+                    user_uuid = UUID(user_id)
+                else:
+                    user_uuid = user_id
+                
+                # Query user's custom API key (encrypted)
+                result = await db.execute(
+                    select(User.openai_api_key).where(User.id == user_uuid)
+                )
+                encrypted_api_key = result.scalar_one_or_none()
+                
+                if encrypted_api_key:
+                    # Decrypt the API key
+                    decrypted_key = EncryptionService.decrypt(encrypted_api_key)
+                    if decrypted_key:
+                        logger.info("Using custom user OpenAI API key", user_id=str(user_id))
+                        return AsyncOpenAI(api_key=decrypted_key)
+                    else:
+                        logger.warning("Failed to decrypt user API key, using system default", 
+                                     user_id=str(user_id))
+            except Exception as e:
+                logger.warning("Failed to fetch user custom API key, using system default", 
+                             user_id=str(user_id), error=str(e))
+        
+        # Fall back to system default client
+        return self.client
+
     async def analyze_frame(
         self,
         image_path: str,
         timestamp_seconds: float,
-        frame_number: Optional[int] = None
+        frame_number: Optional[int] = None,
+        user_id: Optional[str] = None,
+        db: Optional[Any] = None
     ) -> Dict:
         """
         Analyze a single frame using GPT-4 Vision API
@@ -142,11 +311,15 @@ Frame timestamp: {timestamp} seconds"""
             image_path: Path to the frame image file
             timestamp_seconds: Timestamp of the frame in the video
             frame_number: Optional frame number
+            user_id: Optional user ID to use custom prompt and API key
+            db: Optional database session to fetch user prompt and API key
         
         Returns:
             Dictionary with 'description', 'ocr_text', and 'processing_time_ms'
         """
-        if not self.client:
+        # Get OpenAI client (user's key or system default)
+        client = await self._get_openai_client(user_id, db)
+        if not client:
             raise ValueError("OpenAI API key not configured")
         
         start_time = time.time()
@@ -157,8 +330,11 @@ Frame timestamp: {timestamp} seconds"""
                 image_data = await f.read()
                 base64_image = base64.b64encode(image_data).decode('utf-8')
             
+            # Get prompt template (user's custom or default)
+            prompt_template = await self.get_prompt_template(user_id, db)
+            
             # Format prompt with timestamp
-            prompt_text = self.prompt_template.format(timestamp=timestamp_seconds)
+            prompt_text = prompt_template.format(timestamp=timestamp_seconds)
             print(f"[GPT Service] Formatted prompt for timestamp: {timestamp_seconds}")
             print(f"[GPT Service] Prompt text length: {len(prompt_text)} characters")
             print(f"[GPT Service] Prompt preview: {prompt_text[:300]}...")
@@ -168,7 +344,7 @@ Frame timestamp: {timestamp} seconds"""
             request_json = True  # Always true since prompt.txt requires JSON
             print(f"[GPT Service] Requesting JSON format: {request_json}")
             
-            # Call GPT-4 Vision API
+            # Call GPT-4 Vision API (use user's client if available)
             api_params = {
                 "model": "gpt-4o-mini",
                 "messages": [
@@ -200,7 +376,7 @@ Frame timestamp: {timestamp} seconds"""
             print(f"[GPT Service] Image path: {image_path}")
             print(f"[GPT Service] Image size: {len(base64_image)} base64 characters")
             
-            response = await self.client.chat.completions.create(**api_params)
+            response = await client.chat.completions.create(**api_params)
             
             print(f"[GPT Service] API call completed successfully")
             
@@ -416,18 +592,24 @@ Frame timestamp: {timestamp} seconds"""
     
     async def analyze_frame_batch(
         self,
-        frames_batch: List[Dict]
+        frames_batch: List[Dict],
+        user_id: Optional[str] = None,
+        db: Optional[Any] = None
     ) -> List[Dict]:
         """
         Analyze a batch of frames in a single GPT API call (up to 10 frames)
         
         Args:
             frames_batch: List of frame dictionaries (max 10 frames)
+            user_id: Optional user ID to use custom API key
+            db: Optional database session to fetch user API key
         
         Returns:
             List of analyzed frames with GPT responses
         """
-        if not self.client:
+        # Get OpenAI client (user's key or system default)
+        client = await self._get_openai_client(user_id, db)
+        if not client:
             raise ValueError("OpenAI API key not configured")
         
         if not frames_batch:
@@ -457,9 +639,37 @@ Frame timestamp: {timestamp} seconds"""
                 logger.warning("No valid images in batch")
                 return frames_batch
             
+            # Get user's custom prompt template if available
+            prompt_template = await self.get_prompt_template(user_id, db)
+            
             # Create prompt that asks for analysis of all frames
             timestamps = [f.get("timestamp", 0.0) for f in frames_batch]
-            prompt_text = f"""Analyze these {len(frames_batch)} video frames and provide a JSON response for EACH frame.
+            
+            # If user has a custom prompt, adapt it for batch processing
+            # Otherwise use default batch prompt
+            if user_id and db and prompt_template != self.prompt_template:
+                # User has custom prompt - adapt it for batch
+                prompt_text = f"""Analyze these {len(frames_batch)} video frames using the following instructions:
+
+{prompt_template}
+
+IMPORTANT: Return a JSON object with a "frames" key containing an array. Each element in the array corresponds to a frame in order:
+{{
+  "frames": [
+    {{
+      "timestamp": <timestamp_in_seconds>,
+      "description": "<detailed_description>",
+      "ocr_text": "<extracted_text_or_null>",
+      "meta_tags": ["tag1", "tag2", "tag3"]
+    }},
+    ...
+  ]
+}}
+
+Frame timestamps (in order): {', '.join([str(ts) for ts in timestamps])}"""
+            else:
+                # Use default batch prompt
+                prompt_text = f"""Analyze these {len(frames_batch)} video frames and provide a JSON response for EACH frame.
 
 For each frame, provide:
 1. A detailed description of what you see (UI elements, text, layout, etc.)
@@ -507,7 +717,7 @@ Frame timestamps (in order): {', '.join([str(ts) for ts in timestamps])}"""
             import asyncio
             try:
                 response = await asyncio.wait_for(
-                    self.client.chat.completions.create(**api_params),
+                    client.chat.completions.create(**api_params),
                     timeout=300.0  # 5 minute timeout per batch
                 )
             except asyncio.TimeoutError:
@@ -624,7 +834,9 @@ Frame timestamps (in order): {', '.join([str(ts) for ts in timestamps])}"""
         self,
         frames: List[Dict],
         max_workers: int = 5,
-        batch_size: int = 10
+        batch_size: int = 10,
+        user_id: Optional[str] = None,
+        db: Optional[Any] = None
     ) -> List[Dict]:
         """
         Analyze multiple frames in batches (production-ready with error handling)
@@ -639,7 +851,9 @@ Frame timestamps (in order): {', '.join([str(ts) for ts in timestamps])}"""
         """
         import asyncio
         
-        if not self.client:
+        # Get OpenAI client (user's key or system default)
+        client = await self._get_openai_client(user_id, db)
+        if not client:
             logger.error("OpenAI API key not configured. Cannot analyze frames.")
             # Return frames with error messages
             for frame in frames:
@@ -664,7 +878,8 @@ Frame timestamps (in order): {', '.join([str(ts) for ts in timestamps])}"""
         logger.info("Processing frames in batches",
                    total_frames=len(frames),
                    batch_size=batch_size,
-                   total_batches=len(frame_batches))
+                   total_batches=len(frame_batches),
+                   using_user_key=user_id is not None)
         
         # Create semaphore to limit concurrent batch API calls
         semaphore = asyncio.Semaphore(max_workers)
@@ -672,7 +887,7 @@ Frame timestamps (in order): {', '.join([str(ts) for ts in timestamps])}"""
         async def analyze_batch_with_semaphore(batch):
             async with semaphore:
                 try:
-                    return await self.analyze_frame_batch(batch)
+                    return await self.analyze_frame_batch(batch, user_id=user_id, db=db)
                 except Exception as e:
                     logger.error("Batch analysis exception",
                                batch_size=len(batch),

@@ -135,6 +135,8 @@ class User(Base):
     role = Column(String(50), nullable=False, default='user')
     is_active = Column(Boolean, nullable=False, default=True)
     last_login_at = Column(TimestampType, nullable=True)
+    frame_analysis_prompt = Column(Text, nullable=True)  # Custom GPT prompt for frame analysis
+    openai_api_key = Column(String(500), nullable=True)  # User's personal OpenAI API key (encrypted in production)
     created_at = Column(TimestampType, nullable=False, server_default=func.now())
     updated_at = Column(TimestampType, nullable=False, server_default=func.now(), onupdate=func.now())
     

@@ -335,7 +335,20 @@ async def get_current_user_info(
     current_user: User = Depends(get_current_user)
 ):
     """Get current user information"""
-    return UserResponse.model_validate(current_user)
+    # Create response but mask the API key for security
+    user_dict = {
+        "id": current_user.id,
+        "full_name": current_user.full_name,
+        "email": current_user.email,
+        "role": current_user.role,
+        "is_active": current_user.is_active,
+        "last_login_at": current_user.last_login_at,
+        "frame_analysis_prompt": current_user.frame_analysis_prompt,
+        "openai_api_key": None,  # Never expose the actual API key
+        "created_at": current_user.created_at,
+        "updated_at": current_user.updated_at
+    }
+    return UserResponse.model_validate(user_dict)
 
 
 # Google OAuth endpoints
@@ -424,33 +437,34 @@ async def google_oauth_callback(
             ip_address=get_client_ip(request)
         )
         
-        # Determine redirect URL
+        # Determine redirect URL - use the frontend callback URL
         frontend_url = settings.CORS_ORIGINS[0] if settings.CORS_ORIGINS else "http://localhost:3000"
         
-        # If state contains a redirect URI, decode and use it
-        redirect_url = f"{frontend_url}/auth/callback"
-        if state:
-            try:
-                import base64
-                decoded_state = base64.urlsafe_b64decode(state.encode()).decode()
-                if decoded_state.startswith("http"):
-                    redirect_url = decoded_state
-            except Exception:
-                pass  # Use default redirect
+        # Redirect to frontend Google OAuth callback with tokens
+        redirect_url = f"{frontend_url}/auth/google/callback?token={access_token}&session={session.session_token}"
         
-        # Redirect to frontend with tokens in URL (or use a more secure method)
-        # For better security, you might want to use a one-time token exchange
-        redirect_url_with_tokens = f"{redirect_url}?token={access_token}&session={session.session_token}"
+        return RedirectResponse(url=redirect_url)
         
-        return RedirectResponse(url=redirect_url_with_tokens)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Google OAuth callback error", error=str(e), exc_info=True)
+    except HTTPException as e:
+        # Re-raise HTTP exceptions with their original status codes
         frontend_url = settings.CORS_ORIGINS[0] if settings.CORS_ORIGINS else "http://localhost:3000"
+        error_message = e.detail if hasattr(e, 'detail') else "Authentication failed"
         return RedirectResponse(
-            url=f"{frontend_url}/auth?error=oauth_failed&message=Authentication failed"
+            url=f"{frontend_url}/auth?error=oauth_failed&message={error_message}"
+        )
+    except Exception as e:
+        logger.error("Google OAuth callback error", 
+                    error=str(e), 
+                    error_type=type(e).__name__,
+                    exc_info=True)
+        frontend_url = settings.CORS_ORIGINS[0] if settings.CORS_ORIGINS else "http://localhost:3000"
+        error_message = "Authentication failed"
+        if "exchange" in str(e).lower() or "token" in str(e).lower():
+            error_message = "Failed to exchange authorization code"
+        elif "user" in str(e).lower() or "create" in str(e).lower():
+            error_message = "Failed to create or retrieve user account"
+        return RedirectResponse(
+            url=f"{frontend_url}/auth?error=oauth_failed&message={error_message}"
         )
 
 
@@ -496,17 +510,40 @@ async def google_oauth_token_exchange(
             ip_address=get_client_ip(request)
         )
         
+        # Create user response without exposing sensitive data
+        user_dict = {
+            "id": user.id,
+            "full_name": user.full_name,
+            "email": user.email,
+            "role": user.role,
+            "is_active": user.is_active,
+            "last_login_at": user.last_login_at,
+            "frame_analysis_prompt": user.frame_analysis_prompt,
+            "openai_api_key": None,  # Never expose the actual API key
+            "created_at": user.created_at,
+            "updated_at": user.updated_at
+        }
+        
         return LoginResponse(
             access_token=access_token,
             session_token=session.session_token,
-            user=UserResponse.model_validate(user),
+            user=UserResponse.model_validate(user_dict),
             expires_at=session.expires_at
         )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Google OAuth token exchange error", error=str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to authenticate with Google")
+        logger.error("Google OAuth token exchange error", 
+                    error=str(e), 
+                    error_type=type(e).__name__,
+                    exc_info=True)
+        # Provide more specific error message if possible
+        error_detail = "Failed to authenticate with Google"
+        if "exchange" in str(e).lower() or "token" in str(e).lower():
+            error_detail = "Failed to exchange authorization code with Google"
+        elif "user" in str(e).lower() or "create" in str(e).lower():
+            error_detail = "Failed to create or retrieve user account"
+        raise HTTPException(status_code=500, detail=error_detail)
 
 
 @app.post("/api/upload", response_model=VideoUploadResponse)
@@ -525,7 +562,30 @@ async def upload_video(
 ):
     """Upload video file and start processing"""
     try:
-        # Validate file
+        # IMPORTANT: Check OpenAI API key BEFORE accepting file upload
+        # This prevents unnecessary file storage if key is missing
+        await db.refresh(current_user)
+        
+        # Check user's encrypted API key
+        has_user_key = False
+        if current_user.openai_api_key:
+            try:
+                from app.utils.encryption import EncryptionService
+                decrypted_key = EncryptionService.decrypt(current_user.openai_api_key)
+                has_user_key = decrypted_key is not None and decrypted_key.strip() != ""
+            except Exception as e:
+                logger.warning("Failed to decrypt user API key", user_id=str(current_user.id), error=str(e))
+        
+        # Check system key
+        has_system_key = settings.OPENAI_API_KEY is not None and settings.OPENAI_API_KEY.strip() != ""
+        
+        if not has_user_key and not has_system_key:
+            raise HTTPException(
+                status_code=400,
+                detail="OpenAI API key is required to process videos. Please add your API key in Settings before uploading videos."
+            )
+        
+        # Validate file (only after key check passes)
         validate_file(file)
         await validate_file_size(file)
         
@@ -1233,9 +1293,10 @@ async def get_activity_logs(
     )
     
     # Add cache headers for better performance
+    # Use mode='json' to serialize datetime objects to ISO format strings
     from fastapi.responses import JSONResponse
     return JSONResponse(
-        content=response_data.model_dump(),
+        content=response_data.model_dump(mode='json'),
         headers={
             "Cache-Control": "private, max-age=60",  # Cache for 1 minute
             "X-Total-Count": str(total),
@@ -1245,29 +1306,8 @@ async def get_activity_logs(
     )
 
 
-@app.get("/api/activity-logs/{log_id}", response_model=ActivityLogResponse)
-async def get_activity_log(
-    log_id: int,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get a specific activity log by ID"""
-    log = await ActivityService.get_activity_by_id(db, log_id, current_user.id)
-    
-    if not log:
-        raise HTTPException(status_code=404, detail="Activity log not found")
-    
-    return ActivityLogResponse(
-        id=log.id,
-        user_id=str(log.user_id),
-        action=log.action,
-        description=log.description,
-        metadata=log.activity_metadata,
-        ip_address=str(log.ip_address) if log.ip_address else None,
-        created_at=log.created_at
-    )
-
-
+# Note: Specific routes must be defined before parameterized routes
+# to avoid route conflicts (e.g., /stats and /actions before /{log_id})
 @app.get("/api/activity-logs/stats", response_model=ActivityLogStatsResponse)
 async def get_activity_stats(
     days: int = Query(30, ge=1, le=365, description="Number of days to include in statistics"),
@@ -1302,6 +1342,239 @@ async def get_available_actions(
     """Get list of available action types for the current user"""
     actions = await ActivityService.get_available_actions(db, current_user.id)
     return sorted(actions)
+
+
+@app.get("/api/activity-logs/{log_id}", response_model=ActivityLogResponse)
+async def get_activity_log(
+    log_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get a specific activity log by ID"""
+    log = await ActivityService.get_activity_by_id(db, log_id, current_user.id)
+    
+    if not log:
+        raise HTTPException(status_code=404, detail="Activity log not found")
+    
+    return ActivityLogResponse(
+        id=log.id,
+        user_id=str(log.user_id),
+        action=log.action,
+        description=log.description,
+        metadata=log.activity_metadata,
+        ip_address=str(log.ip_address) if log.ip_address else None,
+        created_at=log.created_at
+    )
+
+
+# User Settings endpoints
+@app.get("/api/settings/prompt")
+async def get_user_prompt(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get the current user's custom ANALYSIS RULES section"""
+    from app.services.gpt_service import GPTService
+    gpt_service = GPTService()
+    
+    # Refresh user from database to get latest prompt
+    await db.refresh(current_user)
+    
+    # Get default ANALYSIS RULES for reference
+    default_analysis_rules = gpt_service.get_default_analysis_rules()
+    
+    return {
+        "analysis_rules": current_user.frame_analysis_prompt or default_analysis_rules,
+        "has_custom_prompt": current_user.frame_analysis_prompt is not None,
+        "default_analysis_rules": default_analysis_rules
+    }
+
+
+@app.put("/api/settings/prompt")
+async def update_user_prompt(
+    request: Request,
+    prompt_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update the current user's custom ANALYSIS RULES section"""
+    analysis_rules = prompt_data.get("analysis_rules", "").strip()
+    
+    # If empty string or matches default, set to None to use default prompt
+    from app.services.gpt_service import GPTService
+    gpt_service = GPTService()
+    default_analysis_rules = gpt_service.get_default_analysis_rules()
+    
+    if not analysis_rules or analysis_rules == default_analysis_rules:
+        analysis_rules = None
+    
+    # Update user's ANALYSIS RULES
+    current_user.frame_analysis_prompt = analysis_rules
+    await db.commit()
+    await db.refresh(current_user)
+    
+    # Log activity
+    from app.services.activity_service import ActivityService
+    await ActivityService.log_activity(
+        db=db,
+        user_id=current_user.id,
+        action="UPDATE_PROMPT",
+        description="Updated frame analysis ANALYSIS RULES",
+        ip_address=get_client_ip(request)
+    )
+    
+    return {
+        "message": "Analysis rules updated successfully",
+        "analysis_rules": current_user.frame_analysis_prompt or default_analysis_rules,
+        "has_custom_prompt": current_user.frame_analysis_prompt is not None
+    }
+
+
+@app.get("/api/settings/prompt/default")
+async def get_default_prompt(
+    current_user: User = Depends(get_current_user)
+):
+    """Get the default prompt template and ANALYSIS RULES from prompt.txt file"""
+    try:
+        from app.services.gpt_service import GPTService
+        gpt_service = GPTService()
+        
+        default_analysis_rules = gpt_service.get_default_analysis_rules()
+        full_prompt = gpt_service.prompt_template
+        
+        return {
+            "full_prompt": full_prompt,
+            "analysis_rules": default_analysis_rules,
+            "source": "prompt.txt"
+        }
+    except Exception as e:
+        logger.error("Failed to load default prompt", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to load default prompt")
+
+
+@app.get("/api/settings/openai-key")
+async def get_user_openai_key(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get the current user's OpenAI API key (masked for security)"""
+    await db.refresh(current_user)
+    
+    # Mask the API key for security (show only last 4 characters)
+    masked_key = None
+    if current_user.openai_api_key:
+        key = current_user.openai_api_key
+        if len(key) > 4:
+            masked_key = "*" * (len(key) - 4) + key[-4:]
+        else:
+            masked_key = "*" * len(key)
+    
+    return {
+        "has_key": current_user.openai_api_key is not None,
+        "masked_key": masked_key,
+        "key_length": len(current_user.openai_api_key) if current_user.openai_api_key else 0
+    }
+
+
+@app.get("/api/settings/openai-key/check")
+async def check_openai_key_availability(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Check if OpenAI API key is available (user's key or system default)"""
+    await db.refresh(current_user)
+    
+    # Check if user has a custom API key (and it's valid after decryption)
+    has_user_key = False
+    if current_user.openai_api_key:
+        try:
+            from app.utils.encryption import EncryptionService
+            decrypted_key = EncryptionService.decrypt(current_user.openai_api_key)
+            has_user_key = decrypted_key is not None and decrypted_key.strip() != ""
+        except Exception as e:
+            logger.warning("Failed to decrypt user API key during check", user_id=str(current_user.id), error=str(e))
+            has_user_key = False
+    
+    # Check if system has a default API key
+    has_system_key = settings.OPENAI_API_KEY is not None and settings.OPENAI_API_KEY.strip() != ""
+    
+    # Check if either key is available
+    has_any_key = has_user_key or has_system_key
+    
+    return {
+        "has_key": has_any_key,
+        "has_user_key": has_user_key,
+        "has_system_key": has_system_key,
+        "message": "OpenAI API key is available" if has_any_key else "No OpenAI API key found. Please add your API key in Settings or contact administrator."
+    }
+
+
+@app.put("/api/settings/openai-key")
+async def update_user_openai_key(
+    request: Request,
+    key_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update the current user's OpenAI API key (encrypted in database)"""
+    from app.utils.encryption import EncryptionService
+    
+    api_key = key_data.get("api_key", "").strip()
+    
+    # Validate OpenAI API key format (starts with sk- and is at least 20 characters)
+    if api_key:
+        if not api_key.startswith("sk-"):
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid OpenAI API key format. OpenAI API keys should start with 'sk-'"
+            )
+        if len(api_key) < 20:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid OpenAI API key format. API key appears to be too short."
+            )
+        
+        # Encrypt the API key before storing
+        encrypted_key = EncryptionService.encrypt(api_key)
+        if not encrypted_key:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to encrypt API key. Please try again."
+            )
+        api_key = encrypted_key
+    else:
+        # If empty string, set to None to use system default
+        api_key = None
+    
+    # Update user's API key (encrypted)
+    current_user.openai_api_key = api_key
+    await db.commit()
+    await db.refresh(current_user)
+    
+    # Log activity
+    from app.services.activity_service import ActivityService
+    await ActivityService.log_activity(
+        db=db,
+        user_id=current_user.id,
+        action="UPDATE_OPENAI_KEY",
+        description="Updated OpenAI API key" if api_key else "Removed OpenAI API key",
+        ip_address=get_client_ip(request)
+    )
+    
+    # Return masked key
+    masked_key = None
+    if current_user.openai_api_key:
+        key = current_user.openai_api_key
+        if len(key) > 4:
+            masked_key = "*" * (len(key) - 4) + key[-4:]
+        else:
+            masked_key = "*" * len(key)
+    
+    return {
+        "message": "OpenAI API key updated successfully" if api_key else "OpenAI API key removed. System default will be used.",
+        "has_key": current_user.openai_api_key is not None,
+        "masked_key": masked_key
+    }
 
 
 # GPT Response endpoints
@@ -1779,6 +2052,58 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
     
     async with AsyncSessionLocal() as db:
         try:
+            # Check if OpenAI API key is available before starting processing
+            from app.database import User, VideoUpload
+            from sqlalchemy import select
+            from app.utils.encryption import EncryptionService
+            
+            # Get user_id from video upload
+            user_id = None
+            if upload_id:
+                from uuid import UUID
+                try:
+                    video_uuid = UUID(upload_id)
+                    result = await db.execute(
+                        select(VideoUpload.user_id).where(VideoUpload.id == video_uuid)
+                    )
+                    user_id = result.scalar_one_or_none()
+                except Exception as e:
+                    logger.warning("Failed to get user_id from upload", upload_id=upload_id, error=str(e))
+            
+            # Check if user has API key
+            has_user_key = False
+            if user_id:
+                try:
+                    result = await db.execute(
+                        select(User.openai_api_key).where(User.id == user_id)
+                    )
+                    encrypted_key = result.scalar_one_or_none()
+                    if encrypted_key:
+                        decrypted_key = EncryptionService.decrypt(encrypted_key)
+                        has_user_key = decrypted_key is not None and decrypted_key.strip() != ""
+                except Exception as e:
+                    logger.warning("Failed to check user API key", user_id=str(user_id), error=str(e))
+            
+            # Check system key
+            has_system_key = settings.OPENAI_API_KEY is not None and settings.OPENAI_API_KEY.strip() != ""
+            
+            if not has_user_key and not has_system_key:
+                error_message = "OpenAI API key is required to process videos. Please add your API key in Settings."
+                logger.error("No OpenAI API key available", job_id=job_id, upload_id=upload_id, user_id=str(user_id) if user_id else None)
+                await JobService.update_job(db, job_id, {
+                    "status": "failed",
+                    "message": error_message,
+                    "error": error_message
+                })
+                # Update upload status to failed
+                if upload_id:
+                    try:
+                        from app.services.video_upload_service import VideoUploadService
+                        await VideoUploadService.update_upload_status(db, video_uuid, "failed", job_id)
+                    except Exception as e:
+                        logger.error("Failed to update upload status", error=str(e))
+                return
+            
             # Immediately update job status to show processing has started
             logger.info("Updating job status to show processing started", job_id=job_id)
             await JobService.update_job(db, job_id, {

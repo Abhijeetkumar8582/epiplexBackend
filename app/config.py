@@ -58,10 +58,14 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
     SESSION_TOKEN_LENGTH: int = 32
     
+    # Encryption Settings (for sensitive data like API keys)
+    ENCRYPTION_KEY: Optional[str] = None  # Fernet encryption key (base64-encoded, 32 bytes)
+    
     # Google OAuth2 Settings
+    # Note: GOOGLE_REDIRECT_URI must match EXACTLY what's configured in Google Cloud Console
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
-    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/auth/google/callback"
+    GOOGLE_REDIRECT_URI: str = "http://localhost:3000/auth/google/callback"
     
     # Rate Limiting
     RATE_LIMIT_ENABLED: bool = True

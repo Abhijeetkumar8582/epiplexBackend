@@ -49,6 +49,13 @@ class FrameAnalysisService:
         start_time = time.time()
         
         try:
+            # Get user_id from video upload to use custom prompt
+            from app.database import VideoUpload
+            video_upload_result = await db.execute(
+                select(VideoUpload.user_id).where(VideoUpload.id == video_id)
+            )
+            user_id = video_upload_result.scalar_one_or_none()
+            
             # Step 1: Extract frames (async, non-blocking)
             logger.info("Starting frame extraction", video_id=str(video_id))
             frames = await self.frame_extractor.extract_frames_async(
@@ -71,13 +78,16 @@ class FrameAnalysisService:
             logger.info("Starting frame analysis with GPT", 
                        video_id=str(video_id),
                        frame_count=len(frames),
-                       batch_size=getattr(settings, 'GPT_BATCH_SIZE', 10))
+                       batch_size=getattr(settings, 'GPT_BATCH_SIZE', 10),
+                       user_id=str(user_id) if user_id else None)
             
-            # Use async batch analysis with GPT service
+            # Use async batch analysis with GPT service (pass user_id for custom prompt)
             analyzed_frames = await self.gpt_service.batch_analyze_frames(
                 frames=frames,
                 max_workers=4,
-                batch_size=getattr(settings, 'GPT_BATCH_SIZE', 10)
+                batch_size=getattr(settings, 'GPT_BATCH_SIZE', 10),
+                user_id=str(user_id) if user_id else None,
+                db=db
             )
             
             logger.info("Frame analysis completed",

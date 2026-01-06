@@ -61,6 +61,12 @@ class GoogleOAuthService:
             "grant_type": "authorization_code"
         }
         
+        # Log the request details (without sensitive data)
+        logger.info("Exchanging code for tokens", 
+                   client_id=settings.GOOGLE_CLIENT_ID[:20] + "..." if settings.GOOGLE_CLIENT_ID else None,
+                   redirect_uri=settings.GOOGLE_REDIRECT_URI,
+                   code_length=len(code) if code else 0)
+        
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.post(
@@ -71,10 +77,32 @@ class GoogleOAuthService:
                 response.raise_for_status()
                 return response.json()
             except httpx.HTTPStatusError as e:
-                logger.error("Failed to exchange code for tokens", error=str(e), status_code=e.response.status_code)
+                # Log the actual error response from Google
+                error_detail = "Unknown error"
+                try:
+                    error_response = e.response.json()
+                    error_detail = error_response.get("error_description", error_response.get("error", str(e)))
+                    logger.error("Failed to exchange code for tokens", 
+                               error=error_detail, 
+                               status_code=e.response.status_code,
+                               error_response=error_response,
+                               redirect_uri=settings.GOOGLE_REDIRECT_URI)
+                except:
+                    error_detail = e.response.text or str(e)
+                    logger.error("Failed to exchange code for tokens", 
+                               error=error_detail, 
+                               status_code=e.response.status_code,
+                               redirect_uri=settings.GOOGLE_REDIRECT_URI)
+                
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Failed to exchange authorization code"
+                    detail=f"Failed to exchange authorization code: {error_detail}"
+                )
+            except Exception as e:
+                logger.error("Unexpected error exchanging code for tokens", error=str(e), exc_info=True)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Unexpected error: {str(e)}"
                 )
     
     @staticmethod
@@ -191,21 +219,28 @@ class GoogleOAuthService:
         code: str
     ) -> User:
         """Complete Google OAuth flow: exchange code, get user info, create/get user"""
-        # Exchange code for tokens
-        tokens = await GoogleOAuthService.exchange_code_for_tokens(code)
-        access_token = tokens.get("access_token")
-        
-        if not access_token:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No access token received from Google"
-            )
-        
-        # Get user info from Google
-        google_user_info = await GoogleOAuthService.get_user_info(access_token)
-        
-        # Get or create user
-        user = await GoogleOAuthService.get_or_create_user_from_google(db, google_user_info)
-        
-        return user
+        try:
+            # Exchange code for tokens
+            tokens = await GoogleOAuthService.exchange_code_for_tokens(code)
+            access_token = tokens.get("access_token")
+            
+            if not access_token:
+                logger.error("No access token in response from Google", tokens=tokens)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No access token received from Google"
+                )
+            
+            # Get user info from Google
+            google_user_info = await GoogleOAuthService.get_user_info(access_token)
+            
+            # Get or create user
+            user = await GoogleOAuthService.get_or_create_user_from_google(db, google_user_info)
+            
+            return user
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Error in authenticate_with_google", error=str(e), exc_info=True)
+            raise
 
