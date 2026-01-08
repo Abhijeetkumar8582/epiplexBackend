@@ -152,3 +152,4 @@ The system automatically cleans up temporary files:
 - Frame files are deleted after base64 images are stored
 - Audio files are deleted after transcription completes
 
+

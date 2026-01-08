@@ -121,3 +121,4 @@ query_monitor = QueryMonitoring()
 # Setup event listeners on import
 query_monitor.setup_event_listeners()
 
+

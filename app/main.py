@@ -32,6 +32,7 @@ from app.services.frame_analysis_service import FrameAnalysisService
 from app.services.cache_service import CacheService
 from app.services.metrics_service import metrics_service
 from app.services.system_monitor import system_monitor
+from app.services.queue_worker_service import queue_worker
 from app.models import (
     UserSignup, UserLogin, SignupResponse, LoginResponse, UserResponse,
     VideoUploadCreate, VideoUploadResponse, VideoUploadListResponse, VideoUploadUpdate, BulkDeleteRequest,
@@ -88,9 +89,14 @@ async def lifespan(app: FastAPI):
     if getattr(settings, 'METRICS_ENABLED', True):
         system_monitor.start_background_monitoring()
     
+    # Start queue worker
+    queue_worker.start()
+    logger.info("Queue worker started")
+    
     yield
     # Shutdown
     logger.info("Shutting down application")
+    queue_worker.stop()
 
 
 app = FastAPI(
@@ -983,28 +989,12 @@ async def upload_video(
             priority=priority or "normal"
         )
         
-        # Initialize job status in database
-        initial_status = {
-            "status": "processing",
-            "progress": 0,
-            "message": "Video uploaded, starting processing...",
-            "current_step": "upload",
-            "step_progress": {
-                "upload": "completed",
-                "extract_audio": "pending",
-                "transcribe": "pending",
-                "extract_frames": "pending",
-                "analyze_frames": "pending",
-                "summary_generation": "pending",
-                "generate_pdf": "pending",
-                "complete": "pending"
-            }
-        }
-        
-        await JobService.create_job(db, job_id, initial_status)
-        
-        # Update upload status to processing
-        await VideoUploadService.update_upload_status(db, video_upload.id, "processing", job_id)
+        # Keep status as "uploaded" - queue worker will pick it up
+        # Don't start processing immediately - let queue worker handle it
+        logger.info("Video uploaded and added to queue", 
+                   upload_id=str(video_upload.id),
+                   video_file_number=video_upload.video_file_number,
+                   job_id=job_id)
         
         # Log activity in background (non-blocking)
         background_tasks.add_task(
@@ -1025,13 +1015,6 @@ async def upload_video(
             video_upload.id
         )
         
-        # Start background processing (complete pipeline: extract audio -> transcribe -> extract frames -> analyze with GPT -> store in DB)
-        logger.info("Starting background video processing task", 
-                   job_id=job_id, 
-                   upload_id=str(video_upload.id),
-                   file_path=str(file_path))
-        background_tasks.add_task(process_video_task, str(file_path), job_id, str(video_upload.id))
-        
         # Invalidate user's video panel cache since a new video was added
         CacheService.invalidate_user_cache(current_user.id)
         
@@ -1042,6 +1025,21 @@ async def upload_video(
         logger.error("Upload error", error=str(e), exc_info=True)
         error_detail = str(e) if settings.DEBUG else "Failed to upload video"
         raise HTTPException(status_code=500, detail=error_detail)
+
+
+@app.get("/api/queue/status")
+async def get_queue_status(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get queue status and statistics
+    
+    Returns:
+        Dictionary with queue statistics (queue size, processing count, etc.)
+    """
+    stats = await queue_worker.get_queue_stats(db)
+    return stats
 
 
 @app.get("/api/status/{job_id}")
@@ -2259,9 +2257,13 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
     2. Extract keyframes (1 every 2 seconds)
     3. Process frames in batches of 5 through ChatGPT 4o Mini
     4. Store everything in database
+    
+    Each video gets isolated temporary directories to prevent conflicts.
     """
     from app.database import AsyncSessionLocal
     from app.services.video_processing_service import VideoProcessingService
+    import tempfile
+    import uuid
     
     logger.info("Background video processing task started", 
                job_id=job_id, 
@@ -2278,6 +2280,35 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
                 "error": "File not found"
             })
         return
+    
+    # Create isolated temporary directories for this specific job
+    # This ensures no conflicts when multiple videos are processed
+    job_temp_dir = None
+    job_frames_dir = None
+    job_audio_dir = None
+    
+    try:
+        # Create unique temp directory for this job
+        job_temp_dir = Path(tempfile.gettempdir()) / f"video_processing_{job_id}_{uuid.uuid4().hex[:8]}"
+        job_frames_dir = job_temp_dir / "frames"
+        job_audio_dir = job_temp_dir / "audio"
+        
+        job_frames_dir.mkdir(parents=True, exist_ok=True)
+        job_audio_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info("Created isolated temp directories for job",
+                   job_id=job_id,
+                   temp_dir=str(job_temp_dir),
+                   frames_dir=str(job_frames_dir),
+                   audio_dir=str(job_audio_dir))
+    except Exception as dir_error:
+        logger.error("Failed to create isolated temp directories",
+                    job_id=job_id,
+                    error=str(dir_error))
+        # Fallback to global directories if temp creation fails
+        job_temp_dir = None  # Mark as None so cleanup won't try to remove it
+        job_frames_dir = FRAMES_DIR
+        job_audio_dir = AUDIO_DIR
     
     async with AsyncSessionLocal() as db:
         try:
@@ -2370,13 +2401,14 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
             if not video_uuid:
                 raise ValueError("Video upload ID is required for processing")
             
-            # Run complete processing pipeline
+            # Run complete processing pipeline with isolated directories
+            # Use job-specific temp directories instead of shared global directories
             result = await processing_service.process_video_complete(
                 video_path=file_path,
                 video_id=video_uuid,
                 job_id=job_id,
-                frames_dir=FRAMES_DIR,
-                audio_dir=AUDIO_DIR,
+                frames_dir=job_frames_dir,  # Use isolated directory
+                audio_dir=job_audio_dir,    # Use isolated directory
                 db=db
             )
             
@@ -2486,6 +2518,21 @@ async def process_video_task(file_path: str, job_id: str, upload_id: Optional[st
                     logger.error("Failed to update video upload status", 
                                upload_id=upload_id, 
                                error=str(upload_error))
+        
+        finally:
+            # Always cleanup isolated temp directories, even on error
+            if job_temp_dir and job_temp_dir.exists():
+                try:
+                    import shutil
+                    shutil.rmtree(job_temp_dir)
+                    logger.info("Cleaned up isolated temp directory",
+                               job_id=job_id,
+                               temp_dir=str(job_temp_dir))
+                except Exception as cleanup_error:
+                    logger.warning("Failed to cleanup temp directory",
+                                 job_id=job_id,
+                                 temp_dir=str(job_temp_dir),
+                                 error=str(cleanup_error))
 
 
 if __name__ == "__main__":

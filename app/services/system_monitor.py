@@ -252,3 +252,4 @@ class SystemMonitor:
 # Singleton instance
 system_monitor = SystemMonitor()
 
+

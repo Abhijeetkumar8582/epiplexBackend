@@ -232,15 +232,52 @@ class VideoProcessingService:
                        job_id=job_id, 
                        audio_path=audio_path)
             
-            # Transcribe using OpenAI Whisper
-            with open(audio_path, 'rb') as audio_file:
-                transcript_response = await self.openai_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="text"
-                )
+            # Transcribe using OpenAI Whisper with retry logic
+            import asyncio
+            from openai import RateLimitError, APIConnectionError, APIError
             
-            transcript = transcript_response if isinstance(transcript_response, str) else transcript_response.text
+            max_retries = 3
+            retry_count = 0
+            transcript = None
+            
+            while retry_count < max_retries:
+                try:
+                    with open(audio_path, 'rb') as audio_file:
+                        transcript_response = await self.openai_client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=audio_file,
+                            response_format="text"
+                        )
+                    
+                    transcript = transcript_response if isinstance(transcript_response, str) else transcript_response.text
+                    break  # Success, exit retry loop
+                    
+                except (RateLimitError, APIConnectionError, APIError) as api_error:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        wait_time = 2 ** retry_count  # Exponential backoff: 2, 4, 8 seconds
+                        logger.warning(f"OpenAI API error during transcription, retrying ({retry_count}/{max_retries})",
+                                     job_id=job_id,
+                                     error=str(api_error),
+                                     wait_time=wait_time)
+                        await asyncio.sleep(wait_time)
+                    else:
+                        # Max retries reached
+                        logger.error("OpenAI API transcription failed after retries",
+                                   job_id=job_id,
+                                   error=str(api_error),
+                                   retries=retry_count)
+                        raise
+                except Exception as e:
+                    # Non-retryable error, raise immediately
+                    raise
+            
+            # Validate transcript
+            if not transcript or not transcript.strip():
+                logger.warning("Transcription returned empty result",
+                             job_id=job_id,
+                             transcript_length=len(transcript) if transcript else 0)
+                transcript = ""  # Set to empty string if None
             
             # Update job status with transcript
             await JobService.update_job(db, job_id, {

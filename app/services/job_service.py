@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from app.database import JobStatus
 from app.utils.logger import logger
 from datetime import datetime
@@ -9,16 +10,42 @@ from typing import Optional, Dict, Any
 class JobService:
     @staticmethod
     async def create_job(db: AsyncSession, job_id: str, initial_status: Dict[str, Any]) -> JobStatus:
-        """Create a new job status record"""
+        """Create a new job status record, or return existing one if it already exists"""
+        # Check if job already exists
+        existing_job = await JobService.get_job(db, job_id)
+        if existing_job:
+            logger.info("Job already exists, returning existing job", job_id=job_id, status=existing_job.status)
+            return existing_job
+        
+        # Create new job
         job = JobStatus(
             job_id=job_id,
             **initial_status
         )
         db.add(job)
-        await db.commit()
-        await db.refresh(job)
-        logger.info("Job created", job_id=job_id, status=initial_status.get("status"))
-        return job
+        
+        try:
+            await db.commit()
+            await db.refresh(job)
+            logger.info("Job created", job_id=job_id, status=initial_status.get("status"))
+            return job
+        except IntegrityError as e:
+            await db.rollback()
+            # Job was created by another process (race condition), fetch and return it
+            logger.info("Job was created by another process (race condition), fetching existing job", 
+                       job_id=job_id, error_code=str(e.orig.args[0]) if hasattr(e, 'orig') and e.orig else None)
+            existing_job = await JobService.get_job(db, job_id)
+            if existing_job:
+                return existing_job
+            else:
+                # If we still can't find it, log error and re-raise
+                logger.error("Duplicate key error but job not found after rollback", job_id=job_id, error=str(e))
+                raise
+        except Exception as e:
+            await db.rollback()
+            # Some other error, re-raise it
+            logger.error("Failed to create job", job_id=job_id, error=str(e), exc_info=True)
+            raise
     
     @staticmethod
     async def get_job(db: AsyncSession, job_id: str) -> Optional[JobStatus]:

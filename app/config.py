@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     FRAME_ANALYSIS_WORKERS: int = 4  # Number of parallel workers for frame analysis
     GPT_BATCH_SIZE: int = 10  # Number of frames to send in a single GPT API call
     
+    # Queue Worker Settings
+    QUEUE_POLL_INTERVAL: int = 5  # Seconds between queue polls (default: 5, legacy - not used in new implementation)
+    QUEUE_PROCESSING_DELAY: int = 60  # Seconds to wait between processing videos (1 minute)
+    QUEUE_CRAWLER_INTERVAL: int = 1800  # Seconds to wait when queue is empty (30 minutes)
+    
     # Database Settings
     # SQL Server format: mssql+aioodbc://user:password@host:port/database?driver=ODBC+Driver+17+for+SQL+Server
     # PostgreSQL format: postgresql+asyncpg://user:password@host:port/database

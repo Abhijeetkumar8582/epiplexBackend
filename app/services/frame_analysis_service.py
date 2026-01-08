@@ -1,5 +1,6 @@
 """High-performance frame analysis service with queues and threading"""
 import asyncio
+import base64
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from uuid import UUID
@@ -7,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from concurrent.futures import ThreadPoolExecutor
 import time
+import aiofiles
 
 from app.database import FrameAnalysis
 from app.services.frame_extraction_service import FrameExtractionService
@@ -97,6 +99,17 @@ class FrameAnalysisService:
             # Step 3: Batch insert to database with full GPT response
             frame_analyses = []
             for frame_data in analyzed_frames:
+                # Read and encode image as base64 for storage
+                base64_image = None
+                image_path = frame_data.get("image_path")
+                if image_path and Path(image_path).exists():
+                    try:
+                        async with aiofiles.open(image_path, 'rb') as img_file:
+                            image_bytes = await img_file.read()
+                            base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                    except Exception as e:
+                        logger.warning(f"Failed to encode image as base64: {image_path}", error=str(e))
+                
                 # Store full GPT response as JSONB
                 gpt_response = {
                     "description": frame_data.get("description"),
@@ -113,6 +126,7 @@ class FrameAnalysisService:
                     timestamp=frame_data["timestamp"],
                     frame_number=frame_data.get("frame_number"),
                     image_path=frame_data["image_path"],
+                    base64_image=base64_image,  # Store base64 encoded image
                     description=frame_data.get("description"),
                     ocr_text=frame_data.get("ocr_text"),
                     gpt_response=gpt_response,  # Store full GPT response

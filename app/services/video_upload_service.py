@@ -27,42 +27,93 @@ class VideoUploadService:
         language_code: Optional[str] = None,
         priority: Optional[str] = "normal"
     ) -> VideoUpload:
-        """Create a new video upload record with unique video file number"""
-        # Generate unique video file number
-        video_file_number = await VideoFileNumberService.generate_video_file_number(db)
+        """
+        Create a new video upload record with unique video file number.
+        Handles race conditions when multiple users upload simultaneously.
+        """
+        from sqlalchemy.exc import IntegrityError
+        import asyncio
         
-        upload = VideoUpload(
-            user_id=user_id,
-            name=name,
-            source_type=source_type,
-            video_url=video_url,
-            original_input=original_input,
-            status=status,
-            job_id=job_id,
-            video_file_number=video_file_number,
-            video_length_seconds=metadata.get("video_length_seconds") if metadata else None,
-            video_size_bytes=metadata.get("video_size_bytes") if metadata else None,
-            mime_type=metadata.get("mime_type") if metadata else None,
-            resolution_width=metadata.get("resolution_width") if metadata else None,
-            resolution_height=metadata.get("resolution_height") if metadata else None,
-            fps=metadata.get("fps") if metadata else None,
-            application_name=application_name,
-            tags=tags,  # JSONB will handle list conversion
-            language_code=language_code,
-            priority=priority or "normal",
-            is_deleted=False
-        )
+        max_retries = 5
+        retry_count = 0
         
-        db.add(upload)
-        await db.commit()
-        await db.refresh(upload)
+        while retry_count < max_retries:
+            try:
+                # Generate unique video file number
+                video_file_number = await VideoFileNumberService.generate_video_file_number(db)
+                
+                upload = VideoUpload(
+                    user_id=user_id,
+                    name=name,
+                    source_type=source_type,
+                    video_url=video_url,
+                    original_input=original_input,
+                    status=status,
+                    job_id=job_id,
+                    video_file_number=video_file_number,
+                    video_length_seconds=metadata.get("video_length_seconds") if metadata else None,
+                    video_size_bytes=metadata.get("video_size_bytes") if metadata else None,
+                    mime_type=metadata.get("mime_type") if metadata else None,
+                    resolution_width=metadata.get("resolution_width") if metadata else None,
+                    resolution_height=metadata.get("resolution_height") if metadata else None,
+                    fps=metadata.get("fps") if metadata else None,
+                    application_name=application_name,
+                    tags=tags,  # JSONB will handle list conversion
+                    language_code=language_code,
+                    priority=priority or "normal",
+                    is_deleted=False
+                )
+                
+                db.add(upload)
+                await db.commit()
+                await db.refresh(upload)
+                
+                logger.info("Video upload created", 
+                           upload_id=str(upload.id), 
+                           video_file_number=video_file_number,
+                           user_id=str(user_id), 
+                           name=name)
+                return upload
+                
+            except IntegrityError as e:
+                # Check if it's a unique constraint violation on video_file_number
+                error_str = str(e.orig) if hasattr(e, 'orig') else str(e)
+                is_unique_violation = (
+                    "unique constraint" in error_str.lower() or
+                    "duplicate key" in error_str.lower() or
+                    "UNIQUE constraint" in error_str.upper() or
+                    "video_file_number" in error_str.lower()
+                )
+                
+                if is_unique_violation and retry_count < max_retries - 1:
+                    retry_count += 1
+                    await db.rollback()
+                    # Small random delay to reduce collision probability
+                    await asyncio.sleep(0.1 * retry_count)
+                    logger.warning(f"Video file number collision detected, retrying (attempt {retry_count}/{max_retries})",
+                                 user_id=str(user_id),
+                                 video_file_number=video_file_number,
+                                 error=error_str)
+                    continue
+                else:
+                    # Max retries reached or not a unique constraint violation
+                    await db.rollback()
+                    logger.error("Failed to create video upload after retries",
+                               user_id=str(user_id),
+                               retry_count=retry_count,
+                               error=error_str,
+                               exc_info=True)
+                    raise
+            except Exception as e:
+                await db.rollback()
+                logger.error("Unexpected error creating video upload",
+                           user_id=str(user_id),
+                           error=str(e),
+                           exc_info=True)
+                raise
         
-        logger.info("Video upload created", 
-                   upload_id=str(upload.id), 
-                   video_file_number=video_file_number,
-                   user_id=str(user_id), 
-                   name=name)
-        return upload
+        # Should never reach here, but just in case
+        raise RuntimeError(f"Failed to create video upload after {max_retries} retries")
     
     @staticmethod
     async def get_upload(
